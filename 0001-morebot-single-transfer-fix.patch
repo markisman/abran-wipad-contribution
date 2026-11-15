@@ -1,0 +1,89 @@
+diff --git a/server/internal/morebot/morebot.go b/server/internal/morebot/morebot.go
+index 1b5c2ef..2ff84e1 100644
+--- a/server/internal/morebot/morebot.go
++++ b/server/internal/morebot/morebot.go
+@@ -509,13 +509,19 @@ func DecideAll(ps []Payment, txs []blu.Tx, r Rule) []Verdict {
+ 		}
+ 	}
+ 	out := make([]Verdict, 0, len(ps))
++	claimed := map[string]bool{}
+ 	for _, p := range ps {
++		var v Verdict
+ 		if !fresh(p) {
+-			out = append(out, decide(p, txs, r, false, nil))
+-			continue
++			v = decide(p, txs, r, false, nil, claimed)
++		} else {
++			ambiguous := perBase[p.base()] > 1
++			v = decide(p, txs, r, ambiguous, reserved, claimed)
++		}
++		if v.TxReceipt != "" {
++			claimed[v.TxReceipt] = true
+ 		}
+-		ambiguous := perBase[p.base()] > 1
+-		out = append(out, decide(p, txs, r, ambiguous, reserved))
++		out = append(out, v)
+ 	}
+ 	return out
+ }
+@@ -527,10 +533,10 @@ func (p Payment) base() int64 { return p.Amount - p.Amount%1000 }
+ // DecideID decides one payment on its own. Callers with a queue should use
+ // DecideAll, which can see that two orders compete for the same deposit.
+ func DecideID(p Payment, txs []blu.Tx, r Rule) Verdict {
+-	return decide(p, txs, r, false, nil)
++	return decide(p, txs, r, false, nil, nil)
+ }
+ 
+-func decide(p Payment, txs []blu.Tx, r Rule, ambiguous bool, reserved map[string]bool) Verdict {
++func decide(p Payment, txs []blu.Tx, r Rule, ambiguous bool, reserved, used map[string]bool) Verdict {
+ 	v := Verdict{PaymentID: p.ID, User: p.User, Username: p.Username, UserID: p.UserID, Amount: p.Amount, Action: "skip"}
+ 	if !r.allows(p.MethodType) {
+ 		v.Reason = "روش پرداخت در فهرست مجاز نیست"
+@@ -566,6 +572,9 @@ func decide(p Payment, txs []blu.Tx, r Rule, ambiguous bool, reserved map[string
+ 	var nearD int64
+ 	for i := range txs {
+ 		tx := txs[i]
++		if used[tx.Receipt] {
++			continue
++		}
+ 		if !tx.Credit || !incoming(tx.Type) || ownTransfer(txs, tx) {
+ 			continue
+ 		}
+@@ -667,6 +676,9 @@ func decide(p Payment, txs []blu.Tx, r Rule, ambiguous bool, reserved map[string
+ 	// added zero — a factor of ten either way — because that is the mistake a
+ 	// person actually makes. Everything else waits quietly for its own transfer.
+ 	for _, tx := range txs {
++		if used[tx.Receipt] {
++			continue
++		}
+ 		if !tx.Credit || !incoming(tx.Type) || ownTransfer(txs, tx) || tx.Amount <= 0 {
+ 			continue
+ 		}
+diff --git a/server/internal/morebot/morebot_test.go b/server/internal/morebot/morebot_test.go
+index c3d52f8..646e974 100644
+--- a/server/internal/morebot/morebot_test.go
++++ b/server/internal/morebot/morebot_test.go
+@@ -25,6 +25,23 @@ func tx(rial int64, at int64, receipt string) blu.Tx {
+ 	return blu.Tx{Receipt: receipt, Amount: rial, Credit: true, At: at}
+ }
+ 
++func TestDecideAllDoesNotReuseOneTransfer(t *testing.T) {
++	now := time.Now().Unix()
++	p1 := pay(650902, "card_to_card", now-60)
++	p2 := pay(650902, "card_to_card", now-60)
++	p2.ID = "p2"
++	vs := DecideAll([]Payment{p1, p2}, []blu.Tx{tx(6509020, now-30, "r1")}, DefaultRule())
++	approved := 0
++	for _, v := range vs {
++		if v.Action == "approve" {
++			approved++
++		}
++	}
++	if approved != 1 {
++		t.Fatalf("one transfer must approve at most one order, got %d: %+v", approved, vs)
++	}
++}
++
+ func TestDecideApprovesTheExactAmount(t *testing.T) {
+ 	now := time.Now().Unix()
+ 	v := DecideID(pay(650902, "card_to_card", now-60), []blu.Tx{tx(6509020, now-30, "r1")}, DefaultRule())

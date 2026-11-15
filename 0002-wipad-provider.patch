@@ -1,0 +1,495 @@
+diff --git a/server/internal/blu/blu.go b/server/internal/blu/blu.go
+index 5d00e37..07f3c3b 100644
+--- a/server/internal/blu/blu.go
++++ b/server/internal/blu/blu.go
+@@ -70,18 +70,18 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
+ 	}
+ 	res, err := c.hc.Do(req)
+ 	if err != nil {
+-		return fmt.Errorf("سرویس بلو در دسترس نیست: %w", err)
++		return fmt.Errorf("سرویس بانک در دسترس نیست: %w", err)
+ 	}
+ 	defer res.Body.Close()
+ 	body, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+ 	if res.StatusCode >= 400 {
+-		return fmt.Errorf("بلو %d: %s", res.StatusCode, clip(string(body), 160))
++		return fmt.Errorf("بانک %d: %s", res.StatusCode, clip(string(body), 160))
+ 	}
+ 	if out == nil {
+ 		return nil
+ 	}
+ 	if err := json.Unmarshal(body, out); err != nil {
+-		return fmt.Errorf("پاسخ بلو خوانا نیست: %w", err)
++		return fmt.Errorf("پاسخ بانک خوانا نیست: %w", err)
+ 	}
+ 	return nil
+ }
+@@ -94,18 +94,18 @@ func (c *Client) post(ctx context.Context, path string, body []byte, out any) er
+ 	req.Header.Set("Content-Type", "application/json")
+ 	res, err := c.hc.Do(req)
+ 	if err != nil {
+-		return fmt.Errorf("سرویس بلو در دسترس نیست: %w", err)
++		return fmt.Errorf("سرویس بانک در دسترس نیست: %w", err)
+ 	}
+ 	defer res.Body.Close()
+ 	raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+ 	if res.StatusCode >= 400 {
+-		return fmt.Errorf("بلو %d: %s", res.StatusCode, clip(string(raw), 160))
++		return fmt.Errorf("بانک %d: %s", res.StatusCode, clip(string(raw), 160))
+ 	}
+ 	if out == nil {
+ 		return nil
+ 	}
+ 	if err := json.Unmarshal(raw, out); err != nil {
+-		return fmt.Errorf("پاسخ بلو خوانا نیست: %w", err)
++		return fmt.Errorf("پاسخ بانک خوانا نیست: %w", err)
+ 	}
+ 	return nil
+ }
+@@ -140,8 +140,8 @@ type LoginResult struct {
+ // Login starts a session on the bridge. It does not return a token to us: the
+ // bridge keeps it, which is why every later call is a plain GET.
+ func (c *Client) Login(ctx context.Context, user, pass string) (LoginResult, error) {
+-	if user == "" || pass == "" {
+-		return LoginResult{}, errors.New("نام کاربری و رمز بلو لازم است")
++	if strings.TrimSpace(user) == "" {
++		return LoginResult{}, errors.New("نام کاربری بانک لازم است")
+ 	}
+ 	body, err := json.Marshal(map[string]string{"username": user, "password": pass})
+ 	if err != nil {
+diff --git a/server/internal/router/webmorebot.go b/server/internal/router/webmorebot.go
+index a777c9c..a665334 100644
+--- a/server/internal/router/webmorebot.go
++++ b/server/internal/router/webmorebot.go
+@@ -29,6 +29,7 @@ type bluAcc struct {
+ 	User     string `json:"user,omitempty"`
+ 	Pass     string `json:"pass,omitempty"`
+ 	Disabled bool   `json:"disabled,omitempty"`
++	Provider string `json:"provider,omitempty"`
+ }
+ 
+ type morebotCfg struct {
+@@ -83,6 +84,10 @@ func (c morebotCfg) rule() morebot.Rule {
+ func (c *morebotCfg) normBlus() {
+ 	for i := range c.Blus {
+ 		c.Blus[i].URL = strings.TrimSpace(c.Blus[i].URL)
++		c.Blus[i].Provider = strings.ToLower(strings.TrimSpace(c.Blus[i].Provider))
++		if c.Blus[i].Provider == "" {
++			c.Blus[i].Provider = "blu"
++		}
+ 		if c.Blus[i].URL == "" {
+ 			continue
+ 		}
+@@ -91,10 +96,10 @@ func (c *morebotCfg) normBlus() {
+ 		}
+ 	}
+ 	if len(c.Blus) == 0 && c.BluURL != "" {
+-		c.Blus = []bluAcc{{Name: "حساب ۱", URL: c.BluURL}}
++		c.Blus = []bluAcc{{Name: "حساب ۱", URL: c.BluURL, Provider: "blu"}}
+ 	}
+ 	if len(c.Blus) == 0 {
+-		c.Blus = []bluAcc{{Name: "حساب ۱", URL: "http://127.0.0.1:8088"}}
++		c.Blus = []bluAcc{{Name: "حساب ۱", URL: "http://127.0.0.1:8088", Provider: "blu"}}
+ 	}
+ 	c.BluURL = ""
+ }
+@@ -292,10 +297,11 @@ const bluPendKey = "blu_otp_pending"
+ // used to attach an account without them: the bridge worked until its session
+ // expired and then had nothing to renew with.
+ type bluPendRec struct {
+-	At   int64  `json:"at"`
+-	User string `json:"user"`
+-	Pass string `json:"pass"`
+-	Name string `json:"name"`
++	At       int64  `json:"at"`
++	User     string `json:"user"`
++	Pass     string `json:"pass"`
++	Name     string `json:"name"`
++	Provider string `json:"provider,omitempty"`
+ }
+ 
+ func (r *Router) bluPend() map[string]bluPendRec {
+@@ -333,10 +339,18 @@ func (r *Router) bluPendClear(port int) {
+ 
+ // bluPublic strips passwords from the account list before it reaches a browser:
+ // the form only needs to know whether one is stored.
++func bluPublicPending(in map[string]bluPendRec) map[string]map[string]any {
++	out := map[string]map[string]any{}
++	for port, rec := range in {
++		out[port] = map[string]any{"at": rec.At, "user": rec.User, "name": rec.Name, "has_pass": rec.Pass != "", "provider": rec.Provider}
++	}
++	return out
++}
++
+ func bluPublic(in []bluAcc) []map[string]any {
+ 	out := make([]map[string]any, 0, len(in))
+ 	for _, b := range in {
+-		out = append(out, map[string]any{"name": b.Name, "url": b.URL, "user": b.User, "has_pass": b.Pass != "", "disabled": b.Disabled})
++		out = append(out, map[string]any{"name": b.Name, "url": b.URL, "user": b.User, "has_pass": b.Pass != "", "disabled": b.Disabled, "provider": b.Provider})
+ 	}
+ 	return out
+ }
+@@ -348,7 +362,10 @@ func bluAccAt(accs []bluAcc, base string) (bluAcc, bool) {
+ 		if strings.TrimRight(strings.TrimSpace(a.URL), "/") != base {
+ 			continue
+ 		}
+-		if a.User == "" || a.Pass == "" {
++		if a.Provider == "" {
++			a.Provider = "blu"
++		}
++		if strings.TrimSpace(a.User) == "" || (a.Provider != "wipad" && a.Pass == "") {
+ 			return bluAcc{}, false
+ 		}
+ 		return a, true
+@@ -375,9 +392,20 @@ func (r *Router) bluAutoLogin(ctx context.Context, bc *blu.Client, base string,
+ // the owner just pressed: it skips the throttle (the pending-code guard stays,
+ // because that is the thing that costs an SMS).
+ func (r *Router) bluLogin(ctx context.Context, bc *blu.Client, base string, acc bluAcc, force bool) error {
+-	if strings.TrimSpace(acc.User) == "" || acc.Pass == "" {
++	provider := strings.ToLower(strings.TrimSpace(acc.Provider))
++	if provider == "" {
++		provider = "blu"
++	}
++	if provider == "wipad" {
++		if strings.TrimSpace(acc.User) == "" {
++			return errors.New("برای این حساب شماره موبایل ویپاد ذخیره نشده؛ در «حساب بلو» واردش کن")
++		}
++	} else if strings.TrimSpace(acc.User) == "" || acc.Pass == "" {
+ 		return errors.New("برای این حساب نام کاربری و رمز ذخیره نشده؛ در «حساب بلو» واردش کن")
+ 	}
++	if provider == "wipad" && !force {
++		return errors.New("نشست ویپاد منقضی شده؛ در «حساب بلو» دوباره وارد شو و کد پیامکی را بزن")
++	}
+ 	port := portOfURL(base)
+ 	if rec, ok := r.bluPendPort(port); ok && time.Now().Unix()-rec.At < 900 {
+ 		return errors.New("بانک منتظر کد پیامکی است؛ کد را در «حساب بلو» بزن")
+@@ -415,7 +443,7 @@ func (r *Router) bluLogin(ctx context.Context, bc *blu.Client, base string, acc
+ 	if res.OTP {
+ 		// The bank has sent its one message. Remember the request so nothing
+ 		// else asks again until the owner types the code.
+-		r.bluPendSet(port, bluPendRec{User: acc.User, Pass: acc.Pass, Name: acc.Name})
++		r.bluPendSet(port, bluPendRec{User: acc.User, Pass: acc.Pass, Name: acc.Name, Provider: provider})
+ 		r.Store.Put(errKey, "بانک کد پیامکی فرستاد", 0)
+ 		return errors.New("بانک کد پیامکی فرستاد؛ کد را در «حساب بلو» وارد کن")
+ 	}
+@@ -778,6 +806,15 @@ func (r *Router) morebotRun(dry bool) ([]morebot.Verdict, string) {
+ 				if err := r.mbRetry(ctx, &c, func(mb *morebot.Client) error { return mb.Reject(ctx, p.ID, v.Reason) }); err != nil {
+ 					v.Action = "manual"
+ 					v.Reason = "رد نشد: " + err.Error()
++				} else {
++					v.Reason = "خودکار رد شد — " + v.Reason
++					if v.UserID > 0 {
++						if err := r.morebotTellUser(ctx, &c, v.UserID, mbFakeNote); err != nil {
++							r.morebotErr("ارسال پیام رد خودکار ناموفق", err.Error())
++						}
++					}
++					r.evRow("morebot", "auto", "info", "خودکار رد شد",
++						mbNum(p.Amount)+" تومان", "رد شد", mbVerdictText(v))
+ 				}
+ 			}
+ 		}
+@@ -940,6 +977,7 @@ func (r *Router) MorebotTick() {
+ 	_ = retry
+ 	var lines []string
+ 	var ok []morebot.Verdict
++	rejects := 0
+ 	facts := map[int64]string{}
+ 	for _, v := range vs {
+ 		v.Panel = r.morebotCfg().PanelURL
+@@ -963,12 +1001,18 @@ func (r *Router) MorebotTick() {
+ 			lines = append(lines, line)
+ 			ok = append(ok, v)
+ 		}
++		if strings.HasPrefix(v.Reason, "خودکار رد شد") {
++			rejects++
++			lines = append(lines, mbVerdictText(v))
++		}
+ 	}
+ 	if len(lines) == 0 || r.Bot == nil || r.AlertOff("morebot") {
+ 		return
+ 	}
+ 	head := "✅ تایید خودکار موربات"
+-	if len(lines) > 1 {
++	if rejects > 0 {
++		head = "🤖 نتیجهٔ خودکار موربات"
++	} else if len(lines) > 1 {
+ 		head = "✅ " + faD(strconv.Itoa(len(lines))) + " رسید موربات خودکار تایید شد"
+ 	}
+ 	text := tg.Card(head, strings.Join(lines, "\n\n"))
+@@ -1078,6 +1122,10 @@ func (r *Router) morebotVote(chat, mid int64, data string) {
+ 		return
+ 	}
+ 	var info morebotAskInfo
++	if _, ok := r.Store.GetOK(morebotAskKey + id); !ok {
++		r.Show(chat, mid, "این رسید قبلاً بررسی شده یا سؤالش منقضی شده است.", nil)
++		return
++	}
+ 	r.Store.GetJSON(morebotAskKey+id, &info)
+ 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+ 	defer cancel()
+@@ -1346,6 +1394,7 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 			User     string     `json:"user"`
+ 			Pass     string     `json:"pass"`
+ 			Code     string     `json:"code"`
++			Provider string     `json:"provider"`
+ 			Proxy    string     `json:"proxy"`
+ 		}
+ 		if !webDecode(w, req, &in) {
+@@ -1502,7 +1551,7 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 					return
+ 				}
+ 			}
+-			r.mbAttachBluCreds(&c, a.Name, base, a.User, a.Pass)
++			r.mbAttachBluCreds(&c, a.Name, base, a.User, a.Pass, "blu")
+ 			webOK(w, map[string]any{"ok": true, "url": base})
+ 
+ 		case "blu_login":
+@@ -1565,14 +1614,25 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 			return
+ 
+ 		case "blu_add":
+-			// A second Blu login needs its own bridge process: the service keeps
+-			// one session per process, so a new account is a new port.
+ 			if !r.IsMain(uid) {
+ 				webErr(w, http.StatusForbidden, "فقط ادمین اصلی")
+ 				return
+ 			}
+-			if strings.TrimSpace(in.User) == "" || in.Pass == "" {
+-				webErr(w, http.StatusBadRequest, "نام کاربری و رمز بلو لازم است.")
++			provider := strings.ToLower(strings.TrimSpace(in.Provider))
++			if provider == "" {
++				provider = "blu"
++			}
++			if provider != "blu" && provider != "wipad" {
++				webErr(w, http.StatusBadRequest, "نوع بانک نامعتبر است.")
++				return
++			}
++			label := "بلو"
++			if provider == "wipad" {
++				label = "ویپاد"
++			}
++			user := strings.TrimSpace(in.User)
++			if user == "" || (provider != "wipad" && in.Pass == "") {
++				webErr(w, http.StatusBadRequest, "اطلاعات ورود "+label+" لازم است.")
+ 				return
+ 			}
+ 			for _, b := range c.Blus {
+@@ -1588,10 +1648,11 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 					port = 8089
+ 				}
+ 				base = "http://127.0.0.1:" + strconv.Itoa(port)
+-				// A bridge left over from an interrupted attempt already listens;
+-				// creating it again only churns systemd and can fail while the old
+-				// instance is still starting.
+ 				if _, err := blu.New(base).Status(req.Context()); err != nil {
++					if provider == "wipad" {
++						mbSoftErr(w, "سرویس ویپاد روی این پورت بالا نیست: "+bluFriendly(err))
++						return
++					}
+ 					out, err := exec.CommandContext(req.Context(), "/usr/local/bin/cg-blu-add", strconv.Itoa(port)).CombinedOutput()
+ 					if err != nil {
+ 						mbSoftErr(w, "ساخت حساب بلو ناموفق: "+clipStr(string(out), 200))
+@@ -1603,33 +1664,35 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 			if bport == 0 {
+ 				bport = portOfURL(base)
+ 			}
+-			if rec, ok := r.bluPendPort(bport); ok && time.Now().Unix()-rec.At < 900 {
+-				// A code is already in the phone. Asking again would invalidate it
+-				// and send another SMS, so answer with the request we have.
+-				webOK(w, map[string]any{"url": base, "otp": true, "port": bport})
+-				return
++			if rec, ok := r.bluPendPort(bport); ok {
++				ttl := int64(900)
++				if strings.EqualFold(rec.Provider, "wipad") {
++					ttl = 110
++				}
++				if time.Now().Unix()-rec.At < ttl {
++					webOK(w, map[string]any{"url": base, "otp": true, "port": bport, "provider": provider})
++					return
++				}
+ 			}
+ 			ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
+ 			defer cancel()
+-			res, err := blu.New(base).Login(ctx, strings.TrimSpace(in.User), in.Pass)
++			res, err := blu.New(base).Login(ctx, user, in.Pass)
+ 			if err != nil {
+-				webErr(w, bluHTTP(err), "ورود به بلو ناموفق: "+bluFriendly(err))
++				webErr(w, bluHTTP(err), "ورود به "+label+" ناموفق: "+bluFriendly(err))
+ 				return
+ 			}
+ 			if res.OTP {
+-				if in.Port > 0 {
+-					r.bluPendSet(in.Port, bluPendRec{User: strings.TrimSpace(in.User), Pass: in.Pass, Name: in.Name})
++				if bport > 0 {
++					r.bluPendSet(bport, bluPendRec{User: user, Pass: in.Pass, Name: in.Name, Provider: provider})
+ 				}
+-				webOK(w, map[string]any{"url": base, "otp": true, "port": in.Port})
++				webOK(w, map[string]any{"url": base, "otp": true, "port": bport, "provider": provider})
+ 				return
+ 			}
+-			name, user, pass := in.Name, strings.TrimSpace(in.User), in.Pass
++			name, pass := in.Name, in.Pass
+ 			port := in.Port
+ 			if port == 0 {
+ 				port = portOfURL(base)
+ 			}
+-			// The OTP step may not carry the credentials (an older page, a
+-			// retry after a lost response); the record from the login does.
+ 			if rec, ok := r.bluPendPort(port); ok {
+ 				if user == "" {
+ 					user = rec.User
+@@ -1640,14 +1703,17 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 				if name == "" {
+ 					name = rec.Name
+ 				}
++				if rec.Provider != "" {
++					provider = rec.Provider
++				}
+ 			}
+-			r.mbAttachBluCreds(&c, name, base, user, pass)
+-			webOK(w, map[string]any{"url": base, "otp": false, "done": true})
++			r.mbAttachBluCreds(&c, name, base, user, pass, provider)
++			webOK(w, map[string]any{"url": base, "otp": false, "done": true, "provider": provider})
+ 			return
+ 		case "blu_otp":
+ 			base := strings.TrimRight(strings.TrimSpace(in.URL), "/")
+ 			if base == "" {
+-				webErr(w, http.StatusBadRequest, "آدرس حساب بلو لازم است.")
++				webErr(w, http.StatusBadRequest, "آدرس سرویس بانک لازم است.")
+ 				return
+ 			}
+ 			ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
+@@ -1663,12 +1729,14 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 				return
+ 			}
+ 			name, user, pass := in.Name, strings.TrimSpace(in.User), in.Pass
++			provider := strings.ToLower(strings.TrimSpace(in.Provider))
++			if provider == "" {
++				provider = "blu"
++			}
+ 			port := in.Port
+ 			if port == 0 {
+ 				port = portOfURL(base)
+ 			}
+-			// The OTP step may not carry the credentials (an older page, a
+-			// retry after a lost response); the record from the login does.
+ 			if rec, ok := r.bluPendPort(port); ok {
+ 				if user == "" {
+ 					user = rec.User
+@@ -1679,12 +1747,15 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 				if name == "" {
+ 					name = rec.Name
+ 				}
++				if rec.Provider != "" {
++					provider = rec.Provider
++				}
+ 			}
+-			r.mbAttachBluCreds(&c, name, base, user, pass)
++			r.mbAttachBluCreds(&c, name, base, user, pass, provider)
+ 			if port > 0 {
+ 				r.bluPendClear(port)
+ 			}
+-			webOK(w, map[string]any{"url": base, "done": true})
++			webOK(w, map[string]any{"url": base, "done": true, "provider": provider})
+ 			return
+ 		case "run":
+ 			vs, err := r.morebotRun(in.Dry)
+@@ -1718,6 +1789,7 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 				return mb.Reject(ctx, in.ID, in.Note)
+ 			})
+ 			if err == nil {
++				r.Store.Delete(morebotAskKey + in.ID)
+ 				msgLine := ""
+ 				if in.UserID <= 0 {
+ 					msgLine = "⚠️ شناسهٔ کاربر ذخیره نشده بود؛ پیامی ارسال نشد."
+@@ -1830,30 +1902,36 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 			"auto": c.Auto,
+ 		},
+ 		"blu": status, "morebot": mbState,
+-		"pending":  r.bluPend(),
++		"pending":  bluPublicPending(r.bluPend()),
+ 		"login_at": r.Store.Get(mbLoginAtKey),
+ 	})
+ }
+ 
+ // mbAttachBlu adds a session address to the account list once (by URL), so a
+ // retried login does not leave the same bank listed twice.
+-func (r *Router) mbAttachBluCreds(c *morebotCfg, name, base, user, pass string) {
+-	r.mbAttachBlu(c, name, base)
++func (r *Router) mbAttachBluCreds(c *morebotCfg, name, base, user, pass, provider string) {
++	r.mbAttachBlu(c, name, base, provider)
+ 	for i := range c.Blus {
+ 		if c.Blus[i].URL == base {
+ 			c.Blus[i].User, c.Blus[i].Pass = user, pass
++			c.Blus[i].Provider = provider
+ 		}
+ 	}
+ 	r.morebotSave(*c)
+ }
+ 
+-func (r *Router) mbAttachBlu(c *morebotCfg, name, base string) {
++func (r *Router) mbAttachBlu(c *morebotCfg, name, base, provider string) {
++	provider = strings.ToLower(strings.TrimSpace(provider))
++	if provider == "" {
++		provider = "blu"
++	}
+ 	c.normBlus()
+ 	for i := range c.Blus {
+ 		if c.Blus[i].URL == base {
+ 			if name != "" {
+ 				c.Blus[i].Name = name
+ 			}
++			c.Blus[i].Provider = provider
+ 			r.morebotSave(*c)
+ 			return
+ 		}
+@@ -1861,7 +1939,7 @@ func (r *Router) mbAttachBlu(c *morebotCfg, name, base string) {
+ 	if strings.TrimSpace(name) == "" {
+ 		name = "حساب " + strconv.Itoa(len(c.Blus)+1)
+ 	}
+-	c.Blus = append(c.Blus, bluAcc{Name: name, URL: base})
++	c.Blus = append(c.Blus, bluAcc{Name: name, URL: base, Provider: provider})
+ 	r.morebotSave(*c)
+ }
+ 
+diff --git a/server/internal/router/webmorebot_login_test.go b/server/internal/router/webmorebot_login_test.go
+index 78f1d82..0b60a34 100644
+--- a/server/internal/router/webmorebot_login_test.go
++++ b/server/internal/router/webmorebot_login_test.go
+@@ -157,3 +157,36 @@ func TestBluTransportErrorsAreToldApartFromRefusals(t *testing.T) {
+ 		t.Fatal("nil is not a transport error")
+ 	}
+ }
++
++func TestWipadAccountSkipsAutomaticSms(t *testing.T) {
++	r, _ := bakTestRouter(t)
++	base := "http://127.0.0.1:18099"
++	acc := bluAcc{Name: "ویپاد", URL: base, User: "09121234567", Provider: "wipad"}
++	err := r.bluAutoLogin(context.Background(), blu.New(base), base, acc)
++	if err == nil || !strings.Contains(err.Error(), "ویپاد") {
++		t.Fatalf("wipad auto login must not text, got %v", err)
++	}
++	if _, ok := r.bluPendPort(portOfURL(base)); ok {
++		t.Fatal("wipad auto login must not start a pending login")
++	}
++}
++
++func TestWipadAccountAllowsEmptyPassword(t *testing.T) {
++	accs := []bluAcc{{Name: "ویپاد", URL: "http://127.0.0.1:8089", User: "09121234567", Provider: "wipad"}}
++	acc, ok := bluAccAt(accs, "http://127.0.0.1:8089")
++	if !ok || acc.Provider != "wipad" {
++		t.Fatalf("wipad account should be usable without a password: %+v %v", acc, ok)
++	}
++	bluOnly := []bluAcc{{Name: "بلو", URL: "http://127.0.0.1:8088", User: "u"}}
++	if _, ok := bluAccAt(bluOnly, "http://127.0.0.1:8088"); ok {
++		t.Fatal("blu account without a password must not be usable")
++	}
++}
++
++func TestNormBlusDefaultsProvider(t *testing.T) {
++	c := morebotCfg{Blus: []bluAcc{{Name: "حساب", URL: "http://127.0.0.1:8088"}, {Name: "ویپاد", URL: "http://127.0.0.1:8089", User: "09121234567", Provider: "WIPAD"}}}
++	c.normBlus()
++	if c.Blus[0].Provider != "blu" || c.Blus[1].Provider != "wipad" {
++		t.Fatalf("providers not normalised: %+v", c.Blus)
++	}
++}

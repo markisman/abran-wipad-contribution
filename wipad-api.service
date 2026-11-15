@@ -1,0 +1,29 @@
+[Unit]
+Description=Wipad (Wepod) bank bridge for Morebot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/wipad-api
+Environment=WIPAD_PORT=8089
+Environment=WIPAD_TIMEOUT=45
+Environment=WIPAD_SESSION=/var/lib/wipad-api/session.json
+EnvironmentFile=-/etc/wipad-api/proxy.env
+EnvironmentFile=-/etc/blu-api/proxy.env
+ExecStart=/usr/bin/python3 /opt/wipad-api/bridge.py
+Restart=always
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/wipad-api
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

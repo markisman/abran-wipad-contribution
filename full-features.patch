@@ -1,0 +1,4338 @@
+diff --git a/server/VERSION b/server/VERSION
+index 5ea4c2d..b6afdbe 100644
+--- a/server/VERSION
++++ b/server/VERSION
+@@ -1 +1 @@
+-4.250.146
++4.250.148
+diff --git a/server/cmd/cg-server/main.go b/server/cmd/cg-server/main.go
+index a67450a..cfc124c 100644
+--- a/server/cmd/cg-server/main.go
++++ b/server/cmd/cg-server/main.go
+@@ -302,6 +302,9 @@ func alertLoop(r *router.Router, st *store.Store, bot *tg.Client, adminID int64,
+ 	every("hub", time.Minute, func() { r.HubTick() })
+ 	every("job-watch", time.Minute, func() { r.JobWatchTick() })
+ 	every("morebot", 5*time.Second, func() { r.MorebotTick() })
++	every("repair", time.Minute, func() { r.RepairTick() })
++	every("repair-usage", 5*time.Minute, func() { r.RepairUsageTick() })
++	every("repair-workers", 30*time.Second, func() { r.WorkerTick() })
+ 
+ 	every("digest-usage", time.Hour, func() {
+ 		if r.QuotaPaused() || r.AlertOff("digest") {
+diff --git a/server/internal/blu/blu.go b/server/internal/blu/blu.go
+index 5d00e37..07f3c3b 100644
+--- a/server/internal/blu/blu.go
++++ b/server/internal/blu/blu.go
+@@ -70,18 +70,18 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
+ 	}
+ 	res, err := c.hc.Do(req)
+ 	if err != nil {
+-		return fmt.Errorf("سرویس بلو در دسترس نیست: %w", err)
++		return fmt.Errorf("سرویس بانک در دسترس نیست: %w", err)
+ 	}
+ 	defer res.Body.Close()
+ 	body, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+ 	if res.StatusCode >= 400 {
+-		return fmt.Errorf("بلو %d: %s", res.StatusCode, clip(string(body), 160))
++		return fmt.Errorf("بانک %d: %s", res.StatusCode, clip(string(body), 160))
+ 	}
+ 	if out == nil {
+ 		return nil
+ 	}
+ 	if err := json.Unmarshal(body, out); err != nil {
+-		return fmt.Errorf("پاسخ بلو خوانا نیست: %w", err)
++		return fmt.Errorf("پاسخ بانک خوانا نیست: %w", err)
+ 	}
+ 	return nil
+ }
+@@ -94,18 +94,18 @@ func (c *Client) post(ctx context.Context, path string, body []byte, out any) er
+ 	req.Header.Set("Content-Type", "application/json")
+ 	res, err := c.hc.Do(req)
+ 	if err != nil {
+-		return fmt.Errorf("سرویس بلو در دسترس نیست: %w", err)
++		return fmt.Errorf("سرویس بانک در دسترس نیست: %w", err)
+ 	}
+ 	defer res.Body.Close()
+ 	raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+ 	if res.StatusCode >= 400 {
+-		return fmt.Errorf("بلو %d: %s", res.StatusCode, clip(string(raw), 160))
++		return fmt.Errorf("بانک %d: %s", res.StatusCode, clip(string(raw), 160))
+ 	}
+ 	if out == nil {
+ 		return nil
+ 	}
+ 	if err := json.Unmarshal(raw, out); err != nil {
+-		return fmt.Errorf("پاسخ بلو خوانا نیست: %w", err)
++		return fmt.Errorf("پاسخ بانک خوانا نیست: %w", err)
+ 	}
+ 	return nil
+ }
+@@ -140,8 +140,8 @@ type LoginResult struct {
+ // Login starts a session on the bridge. It does not return a token to us: the
+ // bridge keeps it, which is why every later call is a plain GET.
+ func (c *Client) Login(ctx context.Context, user, pass string) (LoginResult, error) {
+-	if user == "" || pass == "" {
+-		return LoginResult{}, errors.New("نام کاربری و رمز بلو لازم است")
++	if strings.TrimSpace(user) == "" {
++		return LoginResult{}, errors.New("نام کاربری بانک لازم است")
+ 	}
+ 	body, err := json.Marshal(map[string]string{"username": user, "password": pass})
+ 	if err != nil {
+diff --git a/server/internal/cf/blocks.go b/server/internal/cf/blocks.go
+new file mode 100644
+index 0000000..ebae630
+--- /dev/null
++++ b/server/internal/cf/blocks.go
+@@ -0,0 +1,207 @@
++package cf
++
++import (
++	"context"
++	"crypto/rand"
++	"crypto/tls"
++	"encoding/base64"
++	"fmt"
++	"net/http"
++	"net/url"
++	"strings"
++	"time"
++)
++
++type FirewallEvent struct {
++	Action     string `json:"action"`
++	RuleID     string `json:"ruleId"`
++	RayName    string `json:"rayName"`
++	Source     string `json:"source"`
++	DateTime   string `json:"datetime"`
++	Host       string `json:"host"`
++	Path       string `json:"path"`
++	Method     string `json:"method"`
++	UserAgent  string `json:"userAgent"`
++	EdgeStatus int    `json:"edgeResponseStatus"`
++}
++
++func (c *Client) FirewallEvents(zoneID, ray string, hours, limit int) ([]FirewallEvent, error) {
++	if hours <= 0 {
++		hours = 24
++	}
++	if limit <= 0 || limit > 500 {
++		limit = 100
++	}
++	since := time.Now().UTC().Add(-time.Duration(hours) * time.Hour).Format("2006-01-02T15:04:05Z")
++	filter := `datetime_geq:"` + since + `"`
++	if r := strings.TrimSpace(ray); r != "" {
++		filter += `,rayName:"` + gqlEsc(r) + `"`
++	}
++	q := `{viewer{zones(filter:{zoneTag:"` + gqlEsc(zoneID) + `"}){firewallEventsAdaptive(limit:` + fmt.Sprintf("%d", limit) + `,filter:{` + filter + `},orderBy:[datetime_DESC]){action ruleId rayName source datetime clientRequestHTTPHost clientRequestPath clientRequestHTTPMethod userAgent edgeResponseStatus}}}}`
++	d, err := gql(c.token, q)
++	if err != nil {
++		return nil, err
++	}
++	viewer, _ := d["viewer"].(map[string]any)
++	zones, _ := viewer["zones"].([]any)
++	if len(zones) == 0 {
++		return nil, nil
++	}
++	z, _ := zones[0].(map[string]any)
++	rows, _ := z["firewallEventsAdaptive"].([]any)
++	out := make([]FirewallEvent, 0, len(rows))
++	for _, rv := range rows {
++		m, _ := rv.(map[string]any)
++		if m == nil {
++			continue
++		}
++		out = append(out, FirewallEvent{
++			Action: strAny(m["action"]), RuleID: strAny(m["ruleId"]), RayName: strAny(m["rayName"]),
++			Source: strAny(m["source"]), DateTime: strAny(m["datetime"]),
++			Host: strAny(m["clientRequestHTTPHost"]), Path: strAny(m["clientRequestPath"]),
++			Method: strAny(m["clientRequestHTTPMethod"]), UserAgent: strAny(m["userAgent"]),
++			EdgeStatus: intOr(m["edgeResponseStatus"], 0),
++		})
++	}
++	return out, nil
++}
++
++type CFRule struct {
++	RulesetID   string `json:"rulesetId"`
++	RulesetName string `json:"rulesetName"`
++	Phase       string `json:"phase"`
++	Kind        string `json:"kind"`
++	RuleID      string `json:"ruleId"`
++	Action      string `json:"action"`
++	Description string `json:"description"`
++	Enabled     bool   `json:"enabled"`
++}
++
++func (c *Client) Rulesets(zoneID string) ([]CFRule, error) {
++	type rsRule struct {
++		ID          string `json:"id"`
++		Action      string `json:"action"`
++		Description string `json:"description"`
++		Enabled     bool   `json:"enabled"`
++	}
++	type rs struct {
++		ID      string   `json:"id"`
++		Name    string   `json:"name"`
++		Phase   string   `json:"phase"`
++		Kind    string   `json:"kind"`
++		Version string   `json:"version"`
++		Rules   []rsRule `json:"rules"`
++	}
++	var rss []rs
++	if err := req(c, "GET", "/zones/"+url.PathEscape(zoneID)+"/rulesets?per_page=200", nil, &rss); err != nil {
++		return nil, err
++	}
++	out := make([]CFRule, 0, 32)
++	for _, r := range rss {
++		for _, x := range r.Rules {
++			out = append(out, CFRule{RulesetID: r.ID, RulesetName: r.Name, Phase: r.Phase, Kind: r.Kind, RuleID: x.ID, Action: x.Action, Description: x.Description, Enabled: x.Enabled})
++		}
++	}
++	return out, nil
++}
++
++func (c *Client) AddSkip(zoneID, expression, description string, phases []string) (map[string]any, error) {
++	var entry struct {
++		ID    string           `json:"id"`
++		Rules []map[string]any `json:"rules"`
++	}
++	if err := req(c, "GET", "/zones/"+url.PathEscape(zoneID)+"/rulesets/phases/http_request_firewall_custom/entrypoint", nil, &entry); err != nil {
++		return nil, err
++	}
++	rule := map[string]any{"action": "skip", "expression": expression, "description": description, "enabled": true}
++	if len(phases) > 0 {
++		rule["action_parameters"] = map[string]any{"phases": phases}
++	}
++	entry.Rules = append(entry.Rules, rule)
++	var out map[string]any
++	if err := req(c, "PUT", "/zones/"+url.PathEscape(zoneID)+"/rulesets/phases/http_request_firewall_custom/entrypoint", map[string]any{"rules": entry.Rules}, &out); err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *Client) SetRuleEnabled(zoneID, rulesetID, ruleID string, enabled bool) error {
++	var rs struct {
++		Rules []map[string]any `json:"rules"`
++	}
++	if err := req(c, "GET", "/zones/"+url.PathEscape(zoneID)+"/rulesets/"+url.PathEscape(rulesetID), nil, &rs); err != nil {
++		return err
++	}
++	found := false
++	for i := range rs.Rules {
++		if strAny(rs.Rules[i]["id"]) == ruleID {
++			rs.Rules[i]["enabled"] = enabled
++			found = true
++			break
++		}
++	}
++	if !found {
++		return &Error{"rule پیدا نشد"}
++	}
++	return req(c, "PUT", "/zones/"+url.PathEscape(zoneID)+"/rulesets/"+url.PathEscape(rulesetID), map[string]any{"rules": rs.Rules}, nil)
++}
++
++type WSTestResult struct {
++	URL    string `json:"url"`
++	Status int    `json:"status"`
++	Ray    string `json:"ray"`
++	Server string `json:"server"`
++	Error  string `json:"error"`
++	OK     bool   `json:"ok"`
++}
++
++func (c *Client) TestWebSocket(ctx context.Context, raw string) WSTestResult {
++	res := WSTestResult{URL: raw}
++	u, err := url.Parse(strings.TrimSpace(raw))
++	if err != nil || u.Host == "" {
++		res.Error = "URL نامعتبر"
++		return res
++	}
++	switch u.Scheme {
++	case "wss":
++		u.Scheme = "https"
++	case "ws":
++		u.Scheme = "http"
++	case "https", "http":
++	default:
++		res.Error = "scheme باید ws/wss/http/https باشد"
++		return res
++	}
++	key := make([]byte, 16)
++	_, _ = rand.Read(key)
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
++	if err != nil {
++		res.Error = err.Error()
++		return res
++	}
++	req.Header.Set("Connection", "Upgrade")
++	req.Header.Set("Upgrade", "websocket")
++	req.Header.Set("Sec-WebSocket-Version", "13")
++	req.Header.Set("Sec-WebSocket-Key", base64.StdEncoding.EncodeToString(key))
++	req.Header.Set("User-Agent", "CG-CF-Blocks/1.0")
++	hc := &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{ForceAttemptHTTP2: false, TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
++	resp, err := hc.Do(req)
++	if err != nil {
++		res.Error = trunc(err.Error(), 200)
++		return res
++	}
++	defer resp.Body.Close()
++	res.Status = resp.StatusCode
++	res.Ray = resp.Header.Get("cf-ray")
++	res.Server = resp.Header.Get("server")
++	res.OK = resp.StatusCode == http.StatusSwitchingProtocols
++	if !res.OK {
++		res.Error = "handshake rejected: " + resp.Status
++	}
++	return res
++}
++
++func gqlEsc(s string) string {
++	s = strings.ReplaceAll(s, `\`, `\\`)
++	return strings.ReplaceAll(s, `"`, `\"`)
++}
+diff --git a/server/internal/morebot/morebot.go b/server/internal/morebot/morebot.go
+index 1b5c2ef..2ff84e1 100644
+--- a/server/internal/morebot/morebot.go
++++ b/server/internal/morebot/morebot.go
+@@ -509,13 +509,19 @@ func DecideAll(ps []Payment, txs []blu.Tx, r Rule) []Verdict {
+ 		}
+ 	}
+ 	out := make([]Verdict, 0, len(ps))
++	claimed := map[string]bool{}
+ 	for _, p := range ps {
++		var v Verdict
+ 		if !fresh(p) {
+-			out = append(out, decide(p, txs, r, false, nil))
+-			continue
++			v = decide(p, txs, r, false, nil, claimed)
++		} else {
++			ambiguous := perBase[p.base()] > 1
++			v = decide(p, txs, r, ambiguous, reserved, claimed)
++		}
++		if v.TxReceipt != "" {
++			claimed[v.TxReceipt] = true
+ 		}
+-		ambiguous := perBase[p.base()] > 1
+-		out = append(out, decide(p, txs, r, ambiguous, reserved))
++		out = append(out, v)
+ 	}
+ 	return out
+ }
+@@ -527,10 +533,10 @@ func (p Payment) base() int64 { return p.Amount - p.Amount%1000 }
+ // DecideID decides one payment on its own. Callers with a queue should use
+ // DecideAll, which can see that two orders compete for the same deposit.
+ func DecideID(p Payment, txs []blu.Tx, r Rule) Verdict {
+-	return decide(p, txs, r, false, nil)
++	return decide(p, txs, r, false, nil, nil)
+ }
+ 
+-func decide(p Payment, txs []blu.Tx, r Rule, ambiguous bool, reserved map[string]bool) Verdict {
++func decide(p Payment, txs []blu.Tx, r Rule, ambiguous bool, reserved, used map[string]bool) Verdict {
+ 	v := Verdict{PaymentID: p.ID, User: p.User, Username: p.Username, UserID: p.UserID, Amount: p.Amount, Action: "skip"}
+ 	if !r.allows(p.MethodType) {
+ 		v.Reason = "روش پرداخت در فهرست مجاز نیست"
+@@ -566,6 +572,9 @@ func decide(p Payment, txs []blu.Tx, r Rule, ambiguous bool, reserved map[string
+ 	var nearD int64
+ 	for i := range txs {
+ 		tx := txs[i]
++		if used[tx.Receipt] {
++			continue
++		}
+ 		if !tx.Credit || !incoming(tx.Type) || ownTransfer(txs, tx) {
+ 			continue
+ 		}
+@@ -667,6 +676,9 @@ func decide(p Payment, txs []blu.Tx, r Rule, ambiguous bool, reserved map[string
+ 	// added zero — a factor of ten either way — because that is the mistake a
+ 	// person actually makes. Everything else waits quietly for its own transfer.
+ 	for _, tx := range txs {
++		if used[tx.Receipt] {
++			continue
++		}
+ 		if !tx.Credit || !incoming(tx.Type) || ownTransfer(txs, tx) || tx.Amount <= 0 {
+ 			continue
+ 		}
+diff --git a/server/internal/morebot/morebot_test.go b/server/internal/morebot/morebot_test.go
+index c3d52f8..646e974 100644
+--- a/server/internal/morebot/morebot_test.go
++++ b/server/internal/morebot/morebot_test.go
+@@ -25,6 +25,23 @@ func tx(rial int64, at int64, receipt string) blu.Tx {
+ 	return blu.Tx{Receipt: receipt, Amount: rial, Credit: true, At: at}
+ }
+ 
++func TestDecideAllDoesNotReuseOneTransfer(t *testing.T) {
++	now := time.Now().Unix()
++	p1 := pay(650902, "card_to_card", now-60)
++	p2 := pay(650902, "card_to_card", now-60)
++	p2.ID = "p2"
++	vs := DecideAll([]Payment{p1, p2}, []blu.Tx{tx(6509020, now-30, "r1")}, DefaultRule())
++	approved := 0
++	for _, v := range vs {
++		if v.Action == "approve" {
++			approved++
++		}
++	}
++	if approved != 1 {
++		t.Fatalf("one transfer must approve at most one order, got %d: %+v", approved, vs)
++	}
++}
++
+ func TestDecideApprovesTheExactAmount(t *testing.T) {
+ 	now := time.Now().Unix()
+ 	v := DecideID(pay(650902, "card_to_card", now-60), []blu.Tx{tx(6509020, now-30, "r1")}, DefaultRule())
+diff --git a/server/internal/pg/pg.go b/server/internal/pg/pg.go
+index f9baf82..13bf500 100644
+--- a/server/internal/pg/pg.go
++++ b/server/internal/pg/pg.go
+@@ -175,6 +175,72 @@ func (p *Pg) Users(token string, limit int) ([]UserInfo, error) {
+ 	return out, nil
+ }
+ 
++// SearchUsers returns up to limit users from one panel, optionally filtered by
++// the panel's own search box. total is the panel-side match count, so a caller
++// can say "30 of 48912" without fetching every user.
++func (p *Pg) SearchUsers(token, query string, limit int) ([]UserInfo, int, error) {
++	if limit <= 0 || limit > 100 {
++		limit = 30
++	}
++	path := fmt.Sprintf("/api/users?limit=%d&offset=0", limit)
++	if q := strings.TrimSpace(query); q != "" {
++		path += "&search=" + url.QueryEscape(q)
++	}
++	var d struct {
++		Users []rawUser `json:"users"`
++		Total int       `json:"total"`
++	}
++	if err := p.get(token, path, 20*time.Second, &d); err != nil {
++		return nil, 0, err
++	}
++	out := make([]UserInfo, 0, len(d.Users))
++	for _, u := range d.Users {
++		name := strOr(u.Username, u.ID)
++		if name == "" {
++			continue
++		}
++		exp := u.Expire
++		if exp == nil {
++			exp = u.ExpireDate
++		}
++		out = append(out, UserInfo{
++			Username: name,
++			Used:     toF(u.UsedTraffic),
++			Limit:    toF(u.DataLimit),
++			Expire:   exp,
++			Status:   strOr(u.Status, ""),
++			Owner:    ownerOf(u.Admin),
++		})
++	}
++	return out, d.Total, nil
++}
++
++// UserUsage loads one user and normalizes the traffic fields the repair UI and
++// its volume watchdog need. The second result is false when the panel has no
++// such user (or the request failed).
++func (p *Pg) UserUsage(token, username string) (UserInfo, bool) {
++	d := p.User(token, username)
++	if d == nil {
++		return UserInfo{}, false
++	}
++	name := strOr(d["username"], username)
++	if name == "" {
++		return UserInfo{}, false
++	}
++	exp := d["expire"]
++	if exp == nil {
++		exp = d["expire_date"]
++	}
++	return UserInfo{
++		Username: name,
++		Used:     toF(d["used_traffic"]),
++		Limit:    toF(d["data_limit"]),
++		Expire:   exp,
++		Status:   strOr(d["status"], ""),
++		Owner:    ownerOf(d["admin"]),
++	}, true
++}
++
+ func (p *Pg) UsersSince(token, sinceISO string) ([]map[string]any, error) {
+ 	out := []map[string]any{}
+ 	offset := 0
+diff --git a/server/internal/router/menu.go b/server/internal/router/menu.go
+index a247b8e..d4f0aad 100644
+--- a/server/internal/router/menu.go
++++ b/server/internal/router/menu.go
+@@ -82,6 +82,9 @@ func (r *Router) Menu(chat, mid int64) {
+ 	} else {
+ 		rows = append(rows, []Btn{siteBtn})
+ 	}
++	if u := r.webLink("repair"); u != "" {
++		rows = append(rows, []Btn{btnWAS("🛠 تعمیر خودکار", u, "primary")})
++	}
+ 	r.Show(chat, mid, r.menuText(), rows)
+ }
+ 
+diff --git a/server/internal/router/menu_test.go b/server/internal/router/menu_test.go
+index 3ee00bd..2d9456f 100644
+--- a/server/internal/router/menu_test.go
++++ b/server/internal/router/menu_test.go
+@@ -60,8 +60,8 @@ func TestHomeMenuKeepsOnlyCloudflare(t *testing.T) {
+ 	if err := json.Unmarshal([]byte(raw), &kb); err != nil {
+ 		t.Fatalf("keyboard is not readable: %v (%q)", err, raw)
+ 	}
+-	if len(kb.InlineKeyboard) != 2 {
+-		t.Fatalf("want a Cloudflare row and a door row, got %d rows", len(kb.InlineKeyboard))
++	if len(kb.InlineKeyboard) < 2 || len(kb.InlineKeyboard) > 3 {
++		t.Fatalf("want Cloudflare, a door row and at most one custom row, got %d rows", len(kb.InlineKeyboard))
+ 	}
+ 	first := kb.InlineKeyboard[0]
+ 	if len(first) != 1 || !strings.Contains(first[0].Text, "کلودفلر") {
+@@ -85,6 +85,12 @@ func TestHomeMenuKeepsOnlyCloudflare(t *testing.T) {
+ 	if !strings.Contains(last[1].URL, "/app/") || !strings.Contains(last[1].URL, "k=") {
+ 		t.Fatalf("panel button must carry a ticket: %+v", last[1])
+ 	}
++	if len(kb.InlineKeyboard) == 3 {
++		custom := kb.InlineKeyboard[2]
++		if len(custom) != 1 || !strings.Contains(custom[0].Text, "تعمیر") {
++			t.Fatalf("third row must be the custom repair shortcut: %+v", custom)
++		}
++	}
+ 	for _, row := range kb.InlineKeyboard {
+ 		for _, b := range row {
+ 			if strings.Contains(b.Text, "هتزنر") || strings.Contains(b.Text, "پاسارگارد") || strings.Contains(b.Text, "ساب‌فیلتر") {
+diff --git a/server/internal/router/repair.go b/server/internal/router/repair.go
+new file mode 100644
+index 0000000..3574670
+--- /dev/null
++++ b/server/internal/router/repair.go
+@@ -0,0 +1,2006 @@
++package router
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/url"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++)
++
++const (
++	repairCfgKey    = "repair_cfg"
++	repairStateKey  = "repair_state"
++	repairLogKey    = "repair_log"
++	repairLastKey   = "repair_last"
++	repairHostsKey  = "repair_hosts"
++	repairChatKey   = "repair_chat"
++	repairDefPrompt = "تو یک متخصص شبکه و Xray هستی. هاست پاسارگارد داده شده کند/قطع است. فقط یکی از اقدامات مجاز را انتخاب کن و خروجی را فقط JSON بده: {\"action\":\"...\",\"value\":\"...\",\"reason\":\"...\"}. مقدار value باید دقیقاً از فهرست candidates انتخاب شود. اگر مطمئن نیستی action را noop بگذار."
++)
++
++type repairCfg struct {
++	Enabled            bool                `json:"enabled"`
++	Auto               bool                `json:"auto"`
++	IntervalMin        int                 `json:"intervalMin"`
++	DSKey              string              `json:"deepseekKey"`
++	DSBase             string              `json:"deepseekBase"`
++	DSModel            string              `json:"deepseekModel"`
++	Prompt             string              `json:"prompt"`
++	PromptIDs          map[string]string   `json:"promptIDs"`
++	TestUsers          map[string]string   `json:"testUsers"`
++	HostPrompts        map[string]string   `json:"hostPrompts"`
++	HostPromptList     map[string][]string `json:"hostPromptList"`
++	HostPromptItemIDs  map[string][]string `json:"hostPromptItemIDs"`
++	HostPromptAll      string              `json:"hostPromptAll"`
++	HostPromptAllList  []string            `json:"hostPromptAllList"`
++	MinMbps            float64             `json:"minMbps"`
++	MaxLatencyMs       float64             `json:"maxLatencyMs"`
++	DropPct            float64             `json:"dropPct"`
++	ThroughputBytes    int                 `json:"throughputBytes"`
++	ThroughputEveryMin int                 `json:"throughputEveryMin"`
++	MaxActionsPerRun   int                 `json:"maxActionsPerRun"`
++}
++
++type repairHostState struct {
++	Base         []float64 `json:"base,omitempty"`
++	Fails        int       `json:"fails,omitempty"`
++	LastCheck    int64     `json:"lastCheck,omitempty"`
++	Latency      float64   `json:"latency,omitempty"`
++	Mbps         float64   `json:"mbps,omitempty"`
++	LastAction   string    `json:"lastAction,omitempty"`
++	LastActionTS int64     `json:"lastActionTs,omitempty"`
++	ThruTS       int64     `json:"thruTs,omitempty"`
++	NoLink       bool      `json:"noLink,omitempty"`
++}
++
++type repairLogEntry struct {
++	TS       int64   `json:"ts"`
++	Key      string  `json:"key"`
++	Panel    string  `json:"panel"`
++	Host     string  `json:"host"`
++	Remark   string  `json:"remark"`
++	Action   string  `json:"action"`
++	Value    string  `json:"value"`
++	Reason   string  `json:"reason"`
++	Result   string  `json:"result"`
++	Detail   string  `json:"detail"`
++	Latency  float64 `json:"latency"`
++	Mbps     float64 `json:"mbps"`
++	Baseline float64 `json:"baseline"`
++}
++
++type repairAction struct {
++	Action string `json:"action"`
++	Value  string `json:"value"`
++	Reason string `json:"reason"`
++}
++
++var repairBusy atomic.Bool
++
++// Panel logins are only needed to list usernames while someone types in the
++// repair page. Cache the token briefly so a search box does not hammer the
++// panel's /api/admin/token on every keystroke.
++var (
++	repairTokMu sync.Mutex
++	repairToks  = map[string]repairToken{}
++)
++
++type repairToken struct {
++	tok string
++	exp time.Time
++}
++
++func repairCachedToken(key string, login func() (string, error)) (string, error) {
++	now := time.Now()
++	repairTokMu.Lock()
++	if t, ok := repairToks[key]; ok && now.Before(t.exp) {
++		repairTokMu.Unlock()
++		return t.tok, nil
++	}
++	repairTokMu.Unlock()
++	tok, err := login()
++	if err != nil {
++		return "", err
++	}
++	repairTokMu.Lock()
++	repairToks[key] = repairToken{tok: tok, exp: now.Add(10 * time.Minute)}
++	repairTokMu.Unlock()
++	return tok, nil
++}
++
++func repairModelOK(m string) bool {
++	return m == "deepseek-flash" || m == "deepseek-v4-pro"
++}
++
++// Panel-URL keys are stable when panels are added, removed or reordered;
++// numeric-index keys are kept as a fallback for old saved configs.
++func repairPanelKey(url string) string { return strings.TrimRight(strings.TrimSpace(url), "/") }
++
++func repairHostKey(url, id string) string {
++	return repairPanelKey(url) + "#" + strings.TrimSpace(id)
++}
++
++// Every prompt gets a short stable tag. A prompt may mention another tag
++// (#P8868, @P8868 or [[P8868]]) and the referenced prompt is attached to the
++// DeepSeek system message at send time. Shared (S1...) and global (G) prompts
++// are always present, so only other configs' prompts need expanding.
++func repairIDSlug(s string) string {
++	var b strings.Builder
++	for _, r := range s {
++		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
++			b.WriteRune(r)
++		}
++	}
++	if b.Len() == 0 {
++		return "X"
++	}
++	return b.String()
++}
++
++func repairUniqueID(base string, used map[string]bool) string {
++	if !used[base] {
++		used[base] = true
++		return base
++	}
++	for i := 2; ; i++ {
++		id := fmt.Sprintf("%s-%d", base, i)
++		if !used[id] {
++			used[id] = true
++			return id
++		}
++	}
++}
++
++func repairEnsurePromptIDs(c *repairCfg) {
++	if c.PromptIDs == nil {
++		c.PromptIDs = map[string]string{}
++	}
++	if c.HostPromptItemIDs == nil {
++		c.HostPromptItemIDs = map[string][]string{}
++	}
++	used := map[string]bool{}
++	for _, id := range c.PromptIDs {
++		if id != "" {
++			used[id] = true
++		}
++	}
++	keys := make([]string, 0, len(c.HostPromptList)+len(c.HostPrompts))
++	seen := map[string]bool{}
++	for k := range c.HostPromptList {
++		keys = append(keys, k)
++		seen[k] = true
++	}
++	for k := range c.HostPrompts {
++		if !seen[k] {
++			keys = append(keys, k)
++		}
++	}
++	sort.Strings(keys)
++	for _, k := range keys {
++		if c.PromptIDs[k] != "" {
++			continue
++		}
++		host := k
++		if i := strings.LastIndex(k, "#"); i >= 0 {
++			host = k[i+1:]
++		}
++		c.PromptIDs[k] = repairUniqueID("P"+repairIDSlug(host), used)
++	}
++	// Each prompt item inside a config gets its own stable tag (P8883.1,
++	// P8883.2, ...) so one prompt can reference a single prompt of another
++	// config, not only the whole config.
++	for _, k := range keys {
++		list := c.HostPromptList[k]
++		if len(list) == 0 {
++			continue
++		}
++		items := c.HostPromptItemIDs[k]
++		for len(items) < len(list) {
++			items = append(items, "")
++		}
++		base := c.PromptIDs[k]
++		if base == "" {
++			host := k
++			if i := strings.LastIndex(k, "#"); i >= 0 {
++				host = k[i+1:]
++			}
++			base = "P" + repairIDSlug(host)
++		}
++		for i := range list {
++			if items[i] == "" {
++				items[i] = repairUniqueID(base+"."+strconv.Itoa(i+1), used)
++			} else {
++				used[items[i]] = true
++			}
++		}
++		c.HostPromptItemIDs[k] = items[:len(list)]
++	}
++	if c.PromptIDs["global"] == "" {
++		c.PromptIDs["global"] = repairUniqueID("G", used)
++	}
++	for i := range c.HostPromptAllList {
++		k := "shared:" + strconv.Itoa(i)
++		if c.PromptIDs[k] == "" {
++			c.PromptIDs[k] = "S" + strconv.Itoa(i+1)
++		}
++	}
++	if len(c.HostPromptAllList) == 0 && strings.TrimSpace(c.HostPromptAll) != "" && c.PromptIDs["shared:0"] == "" {
++		c.PromptIDs["shared:0"] = "S1"
++	}
++}
++
++type repairPromptDoc struct {
++	ID    string
++	Key   string
++	Label string
++	Text  string
++}
++
++func repairPromptDocs(c repairCfg) []repairPromptDoc {
++	out := make([]repairPromptDoc, 0, 8)
++	gid := c.PromptIDs["global"]
++	if gid == "" {
++		gid = "G"
++	}
++	out = append(out, repairPromptDoc{ID: gid, Key: "global", Label: "پرامپت سراسری", Text: c.Prompt})
++	keys := make([]string, 0, len(c.HostPromptList)+len(c.HostPrompts))
++	seen := map[string]bool{}
++	for k := range c.HostPromptList {
++		keys = append(keys, k)
++		seen[k] = true
++	}
++	for k := range c.HostPrompts {
++		if !seen[k] {
++			keys = append(keys, k)
++		}
++	}
++	sort.Strings(keys)
++	for _, k := range keys {
++		text := strings.Join(c.HostPromptList[k], "\n\n")
++		if strings.TrimSpace(text) == "" {
++			text = c.HostPrompts[k]
++		}
++		if strings.TrimSpace(text) == "" {
++			continue
++		}
++		host := k
++		if i := strings.LastIndex(k, "#"); i >= 0 {
++			host = k[i+1:]
++		}
++		id := c.PromptIDs[k]
++		if id == "" {
++			id = "P" + repairIDSlug(host)
++		}
++		out = append(out, repairPromptDoc{ID: id, Key: k, Label: "پرامپت‌های کانفیگ " + host, Text: text})
++		items := c.HostPromptItemIDs[k]
++		for i, item := range c.HostPromptList[k] {
++			if strings.TrimSpace(item) == "" {
++				continue
++			}
++			itemID := ""
++			if i < len(items) {
++				itemID = items[i]
++			}
++			if itemID == "" {
++				itemID = id + "." + strconv.Itoa(i+1)
++			}
++			out = append(out, repairPromptDoc{ID: itemID, Key: k + "::" + strconv.Itoa(i), Label: fmt.Sprintf("پرامپت %d کانفیگ %s", i+1, host), Text: item})
++		}
++	}
++	if len(c.HostPromptAllList) > 0 {
++		for i, x := range c.HostPromptAllList {
++			if strings.TrimSpace(x) == "" {
++				continue
++			}
++			k := "shared:" + strconv.Itoa(i)
++			id := c.PromptIDs[k]
++			if id == "" {
++				id = "S" + strconv.Itoa(i+1)
++			}
++			out = append(out, repairPromptDoc{ID: id, Key: k, Label: fmt.Sprintf("پرامپت مشترک %d", i+1), Text: x})
++		}
++	} else if strings.TrimSpace(c.HostPromptAll) != "" {
++		id := c.PromptIDs["shared:0"]
++		if id == "" {
++			id = "S1"
++		}
++		out = append(out, repairPromptDoc{ID: id, Key: "shared:0", Label: "پرامپت مشترک", Text: c.HostPromptAll})
++	}
++	return out
++}
++
++var repairRefRe = regexp.MustCompile(`(?:#|@)([A-Za-z0-9_.-]{1,32})|\[\[([A-Za-z0-9_.-]{1,32})\]\]`)
++
++func repairRefIDs(text string) []string {
++	out := make([]string, 0, 4)
++	seen := map[string]bool{}
++	for _, m := range repairRefRe.FindAllStringSubmatch(text, -1) {
++		id := m[1]
++		if id == "" {
++			id = m[2]
++		}
++		id = strings.TrimRight(id, ".-")
++		if id != "" && !seen[id] {
++			seen[id] = true
++			out = append(out, id)
++		}
++	}
++	return out
++}
++
++func repairAppendPromptRefs(c repairCfg, base, selfKey string) string {
++	docs := repairPromptDocs(c)
++	byID := map[string]repairPromptDoc{}
++	for _, d := range docs {
++		if strings.TrimSpace(d.Text) != "" {
++			byID[strings.ToLower(d.ID)] = d
++		}
++	}
++	visited := map[string]bool{}
++	if selfKey != "" {
++		visited[selfKey] = true
++		prefix := selfKey + "::"
++		for _, d := range docs {
++			if strings.HasPrefix(d.Key, prefix) {
++				visited[d.Key] = true
++			}
++		}
++	}
++	for _, d := range docs {
++		if d.Key == "global" || strings.HasPrefix(d.Key, "shared:") {
++			visited[d.Key] = true
++		}
++	}
++	add := make([]string, 0, 3)
++	var walk func(string, int)
++	walk = func(text string, depth int) {
++		if depth >= 4 {
++			return
++		}
++		for _, id := range repairRefIDs(text) {
++			d, ok := byID[strings.ToLower(id)]
++			if !ok || visited[d.Key] {
++				continue
++			}
++			visited[d.Key] = true
++			add = append(add, "["+d.ID+"] "+d.Label+":\n"+d.Text)
++			walk(d.Text, depth+1)
++		}
++	}
++	walk(base, 0)
++	if len(add) == 0 {
++		return base
++	}
++	return base + "\n\n=== پرامپت‌های ارجاع‌شده ===\n" + strings.Join(add, "\n\n") + "\n=== پایان پرامپت‌های ارجاع‌شده ==="
++}
++
++// repairUserPromptRefs expands tags written in a chat message. Unlike the
++// system prompt, the chat message can reference the global/shared prompts too
++// (they are already in sys, but the user explicitly asked for that tag and the
++// model needs the mapping). Cycles are still bounded.
++func repairUserPromptRefs(c repairCfg, text string) string {
++	docs := repairPromptDocs(c)
++	byID := map[string]repairPromptDoc{}
++	for _, d := range docs {
++		if strings.TrimSpace(d.Text) != "" {
++			byID[strings.ToLower(d.ID)] = d
++		}
++	}
++	visited := map[string]bool{}
++	add := make([]string, 0, 3)
++	var walk func(string, int)
++	walk = func(t string, depth int) {
++		if depth >= 4 {
++			return
++		}
++		for _, id := range repairRefIDs(t) {
++			d, ok := byID[strings.ToLower(id)]
++			if !ok || visited[d.Key] {
++				continue
++			}
++			visited[d.Key] = true
++			add = append(add, "["+d.ID+"] "+d.Label+":\n"+d.Text)
++			walk(d.Text, depth+1)
++		}
++	}
++	walk(text, 0)
++	if len(add) == 0 {
++		return ""
++	}
++	return "=== ارجاع‌های پیام شما ===\n" + strings.Join(add, "\n\n") + "\n=== پایان ارجاع‌ها ==="
++}
++
++func (r *Router) repairCfg() repairCfg {
++	c := repairCfg{
++		IntervalMin: 5, DSBase: "https://api.deepseek.com", DSModel: "deepseek-flash",
++		Prompt: repairDefPrompt, PromptIDs: map[string]string{}, TestUsers: map[string]string{}, HostPrompts: map[string]string{}, HostPromptList: map[string][]string{}, HostPromptItemIDs: map[string][]string{},
++		MaxLatencyMs: 1500, DropPct: 40, ThroughputBytes: 1000000, ThroughputEveryMin: 30, MaxActionsPerRun: 3,
++	}
++	var saved repairCfg
++	if r.Store.GetJSON(repairCfgKey, &saved) {
++		if saved.IntervalMin > 0 {
++			c.IntervalMin = saved.IntervalMin
++		}
++		if saved.DSBase != "" {
++			c.DSBase = saved.DSBase
++		}
++		if repairModelOK(saved.DSModel) {
++			c.DSModel = saved.DSModel
++		}
++		if saved.Prompt != "" {
++			c.Prompt = saved.Prompt
++		}
++		if saved.PromptIDs != nil {
++			c.PromptIDs = saved.PromptIDs
++		}
++		if saved.TestUsers != nil {
++			c.TestUsers = saved.TestUsers
++		}
++		if saved.HostPrompts != nil {
++			c.HostPrompts = saved.HostPrompts
++		}
++		if saved.HostPromptList != nil {
++			c.HostPromptList = saved.HostPromptList
++		}
++		if saved.HostPromptItemIDs != nil {
++			c.HostPromptItemIDs = saved.HostPromptItemIDs
++		}
++		c.HostPromptAll = saved.HostPromptAll
++		c.HostPromptAllList = saved.HostPromptAllList
++		c.Enabled, c.Auto = saved.Enabled, saved.Auto
++		c.DSKey = saved.DSKey
++		if saved.MaxLatencyMs > 0 {
++			c.MaxLatencyMs = saved.MaxLatencyMs
++		}
++		if saved.DropPct > 0 {
++			c.DropPct = saved.DropPct
++		}
++		if saved.MinMbps > 0 {
++			c.MinMbps = saved.MinMbps
++		}
++		if saved.ThroughputEveryMin > 0 {
++			c.ThroughputEveryMin = saved.ThroughputEveryMin
++		}
++		c.ThroughputBytes = saved.ThroughputBytes
++		if saved.MaxActionsPerRun > 0 {
++			c.MaxActionsPerRun = saved.MaxActionsPerRun
++		}
++	}
++	// Move old index-based keys (0 / "0:id") to stable panel-URL keys so
++	// prompts and test users survive panel reordering or deletion.
++	for i, p := range r.PanelsRaw() {
++		pk := repairPanelKey(p.URL)
++		old := strconv.Itoa(i)
++		if v, ok := c.TestUsers[old]; ok && strings.TrimSpace(v) != "" {
++			if _, exists := c.TestUsers[pk]; !exists {
++				c.TestUsers[pk] = v
++			}
++		}
++		delete(c.TestUsers, old)
++		prefix := old + ":"
++		for k, v := range c.HostPrompts {
++			if strings.HasPrefix(k, prefix) {
++				nk := repairHostKey(p.URL, strings.TrimPrefix(k, prefix))
++				if _, ok := c.HostPrompts[nk]; !ok {
++					c.HostPrompts[nk] = v
++				}
++				delete(c.HostPrompts, k)
++			}
++		}
++		for k, v := range c.HostPromptList {
++			if strings.HasPrefix(k, prefix) {
++				nk := repairHostKey(p.URL, strings.TrimPrefix(k, prefix))
++				if _, ok := c.HostPromptList[nk]; !ok {
++					c.HostPromptList[nk] = v
++				}
++				delete(c.HostPromptList, k)
++			}
++		}
++	}
++	repairEnsurePromptIDs(&c)
++	return c
++}
++
++func (r *Router) repairCfgSave(c repairCfg) { r.Store.PutJSON(repairCfgKey, c, 0) }
++
++func (r *Router) repairStateLoad() map[string]repairHostState {
++	out := map[string]repairHostState{}
++	_ = r.Store.GetJSON(repairStateKey, &out)
++	if out == nil {
++		out = map[string]repairHostState{}
++	}
++	return out
++}
++
++func (r *Router) repairStateSave(m map[string]repairHostState) { r.Store.PutJSON(repairStateKey, m, 0) }
++
++func (r *Router) repairLogAdd(e repairLogEntry) {
++	var list []repairLogEntry
++	_ = r.Store.GetJSON(repairLogKey, &list)
++	list = append([]repairLogEntry{e}, list...)
++	if len(list) > 200 {
++		list = list[:200]
++	}
++	r.Store.PutJSON(repairLogKey, list, 0)
++}
++
++func (r *Router) repairLog() []repairLogEntry {
++	var list []repairLogEntry
++	_ = r.Store.GetJSON(repairLogKey, &list)
++	return list
++}
++
++type repairChatEntry struct {
++	TS         int64   `json:"ts"`
++	Kind       string  `json:"kind"`
++	Panel      string  `json:"panel"`
++	HostID     string  `json:"hostId"`
++	HostRemark string  `json:"hostRemark"`
++	HostAddr   string  `json:"hostAddr"`
++	Port       int     `json:"port"`
++	Model      string  `json:"model"`
++	Latency    float64 `json:"latency"`
++	Mbps       float64 `json:"mbps"`
++	Why        string  `json:"why"`
++	System     string  `json:"system"`
++	Request    string  `json:"request"`
++	Response   string  `json:"response"`
++	UserText   string  `json:"userText,omitempty"`
++	Context    string  `json:"context,omitempty"`
++	Action     string  `json:"action"`
++	Value      string  `json:"value"`
++	Reason     string  `json:"reason"`
++	Error      string  `json:"error,omitempty"`
++}
++
++func (r *Router) repairChatAdd(e repairChatEntry) {
++	var list []repairChatEntry
++	_ = r.Store.GetJSON(repairChatKey, &list)
++	list = append([]repairChatEntry{e}, list...)
++	if len(list) > 100 {
++		list = list[:100]
++	}
++	r.Store.PutJSON(repairChatKey, list, 0)
++}
++
++func (r *Router) repairChatList() []repairChatEntry {
++	var list []repairChatEntry
++	_ = r.Store.GetJSON(repairChatKey, &list)
++	if list == nil {
++		list = []repairChatEntry{}
++	}
++	return list
++}
++
++// repairHosts is the persisted HOST panel list; loading a panel appends to it,
++// so the cards survive a mini-app reload and a second panel can be added.
++func (r *Router) repairHosts() []map[string]any {
++	var list []map[string]any
++	_ = r.Store.GetJSON(repairHostsKey, &list)
++	if list == nil {
++		list = []map[string]any{}
++	}
++	return list
++}
++
++// repairSyncHostCard mirrors a change made through the panel API back into the
++// persisted HOST card, so the HOST section is a live mirror instead of a stale
++// snapshot after an automatic repair.
++func (r *Router) repairSyncHostCard(panelURL, id string, h map[string]any) {
++	if h == nil {
++		return
++	}
++	list := r.repairHosts()
++	urlKey := repairPanelKey(panelURL)
++	changed := false
++	for _, c := range list {
++		if repairPanelKey(strv(c["panelUrl"])) != urlKey || strv(c["id"]) != strings.TrimSpace(id) {
++			continue
++		}
++		c["address"] = hfList(h["address"])
++		c["port"] = h["port"]
++		c["sni"] = hfList(h["sni"])
++		c["host"] = hfList(h["host"])
++		c["security"] = strv(h["security"])
++		c["path"] = strv(h["path"])
++		c["inbound_tag"] = strv(h["inbound_tag"])
++		c["disabled"] = boolVal(h["is_disabled"])
++		changed = true
++	}
++	if changed {
++		r.Store.PutJSON(repairHostsKey, list, 0)
++	}
++}
++
++// repairPruneHosts drops cards that belong to panels that no longer exist.
++func (r *Router) repairPruneHosts() []map[string]any {
++	list := r.repairHosts()
++	urls := map[string]bool{}
++	for _, p := range r.PanelsRaw() {
++		urls[repairPanelKey(p.URL)] = true
++	}
++	kept := make([]map[string]any, 0, len(list))
++	removed := false
++	for _, h := range list {
++		if urls[repairPanelKey(strv(h["panelUrl"]))] {
++			kept = append(kept, h)
++		} else {
++			removed = true
++		}
++	}
++	if removed {
++		r.Store.PutJSON(repairHostsKey, kept, 0)
++	}
++	return kept
++}
++
++func (r *Router) RepairTick() {
++	c := r.repairCfg()
++	if !c.Enabled {
++		return
++	}
++	now := time.Now().Unix()
++	if last, _ := strconv.ParseInt(strings.TrimSpace(r.Store.Get(repairLastKey)), 10, 64); last > 0 && now-last < int64(c.IntervalMin)*60 {
++		return
++	}
++	if !repairBusy.CompareAndSwap(false, true) {
++		return
++	}
++	r.Store.Put(repairLastKey, strconv.FormatInt(now, 10), 0)
++	go func() {
++		defer repairBusy.Store(false)
++		r.repairRun(c)
++	}()
++}
++
++const repairUsageAlertKey = "repair_usage_alert"
++
++func repairBytes(n float64) string {
++	if n <= 0 {
++		return "۰"
++	}
++	gb := n / (1024 * 1024 * 1024)
++	if gb >= 1024 {
++		return fmt.Sprintf("%.2f TB", gb/1024)
++	}
++	if gb >= 1 {
++		return fmt.Sprintf("%.1f GB", gb)
++	}
++	return fmt.Sprintf("%.0f MB", n/(1024*1024))
++}
++
++// RepairUsageTick watches the volume of every configured test user and sends a
++// Telegram alert the first time its allowance is exhausted. The flag is cleared
++// when the user is renewed/reset, so the next exhaustion alerts again.
++func (r *Router) RepairUsageTick() {
++	c := r.repairCfg()
++	panels := r.PanelsRaw()
++	if len(panels) == 0 {
++		return
++	}
++	var alerted map[string]bool
++	_ = r.Store.GetJSON(repairUsageAlertKey, &alerted)
++	if alerted == nil {
++		alerted = map[string]bool{}
++	}
++	changed := false
++	for i, p := range panels {
++		uname := strings.TrimSpace(c.TestUsers[repairPanelKey(p.URL)])
++		if uname == "" {
++			uname = strings.TrimSpace(c.TestUsers[strconv.Itoa(i)])
++		}
++		if uname == "" {
++			continue
++		}
++		cli := p.Client()
++		tok, err := repairCachedToken(p.URL+"|"+p.Username, cli.Login)
++		if err != nil {
++			continue
++		}
++		u, ok := cli.UserUsage(tok, uname)
++		if !ok {
++			continue
++		}
++		key := repairPanelKey(p.URL) + ":" + uname
++		done := strings.EqualFold(u.Status, "limited") || (u.Limit > 0 && u.Used >= u.Limit)
++		switch {
++		case done && !alerted[key]:
++			alerted[key] = true
++			changed = true
++			if r.Bot != nil {
++				limit := "نامحدود"
++				if u.Limit > 0 {
++					limit = repairBytes(u.Limit)
++				}
++				msg := fmt.Sprintf("⚠️ <b>حجم یوزر تست تمام شد</b>\nپنل: %s\nیوزر: <code>%s</code>\nمصرف: %s از %s",
++					Esc(pname(p)), Esc(uname), repairBytes(u.Used), limit)
++				go r.Bot.Send(r.AdminID, msg, nil)
++			}
++		case !done && alerted[key]:
++			delete(alerted, key)
++			changed = true
++		}
++	}
++	if changed {
++		r.Store.PutJSON(repairUsageAlertKey, alerted, 0)
++	}
++}
++
++func (r *Router) repairRun(c repairCfg) {
++	if ok, _ := cfgEngineInfo(); !ok {
++		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
++		_ = cfgInstallEngine(ctx)
++		cancel()
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
++	defer cancel()
++	panels := r.PanelsRaw()
++	state := r.repairStateLoad()
++	actions := 0
++	for pi, p := range panels {
++		cli := p.Client()
++		tok, err := cli.Login()
++		if err != nil {
++			continue
++		}
++		rawHosts, err := cli.Hosts(tok)
++		if err != nil {
++			continue
++		}
++		var hosts []map[string]any
++		for _, hv := range rawHosts {
++			if m, ok := hv.(map[string]any); ok {
++				hosts = append(hosts, m)
++			}
++		}
++		var links []cfgLink
++		uname := strings.TrimSpace(c.TestUsers[repairPanelKey(p.URL)])
++		if uname == "" {
++			uname = strings.TrimSpace(c.TestUsers[strconv.Itoa(pi)])
++		}
++		if uname != "" {
++			if uo := cli.User(tok, uname); uo != nil {
++				if sub := strv(uo["subscription_url"]); sub != "" {
++					if raws, se := cfgSubLinks(ctx, sub); se == nil {
++						for _, raw := range raws {
++							if l, pe := cfgParseLink(raw); pe == nil {
++								links = append(links, l)
++							}
++						}
++					}
++				}
++			}
++		}
++		for _, h := range hosts {
++			if ctx.Err() != nil {
++				break
++			}
++			id := strv(h["id"])
++			key := strconv.Itoa(pi) + ":" + id
++			pkey := repairHostKey(p.URL, id)
++			link, ok := repairMatchLink(h, links)
++			st := state[key]
++			if !ok {
++				st.NoLink = true
++				st.LastCheck = time.Now().Unix()
++				state[key] = st
++				continue
++			}
++			st.NoLink = false
++			res := r.cfgTestOne(ctx, link, cfgOpts{Samples: 3, Timeout: 15 * time.Second})
++			st.LastCheck = time.Now().Unix()
++			st.Latency = res.MedianMS
++			st.Fails = 0
++			if res.Verdict == "fail" {
++				st.Fails++
++			}
++			mbps := 0.0
++			now := time.Now().Unix()
++			if c.ThroughputBytes > 0 && (st.ThruTS == 0 || now-st.ThruTS >= int64(c.ThroughputEveryMin)*60) {
++				if v, te := repairThroughput(ctx, link, c.ThroughputBytes); te == nil {
++					mbps = v
++					st.Mbps = v
++					st.ThruTS = now
++				}
++			} else {
++				mbps = st.Mbps
++			}
++			reason := ""
++			base := repairMedian(st.Base)
++			if st.Fails >= 2 {
++				reason = "fail"
++			}
++			if reason == "" && c.MaxLatencyMs > 0 && res.MedianMS > c.MaxLatencyMs {
++				reason = "latency"
++			}
++			if reason == "" && mbps > 0 && c.MinMbps > 0 && mbps < c.MinMbps {
++				reason = "low_speed"
++			}
++			if reason == "" && mbps > 0 && base > 0 && mbps < base*(1-c.DropPct/100) {
++				reason = "drop"
++			}
++			if reason == "" && res.Verdict != "fail" && mbps > 0 {
++				st.Base = append(st.Base, mbps)
++				if len(st.Base) > 5 {
++					st.Base = st.Base[len(st.Base)-5:]
++				}
++			}
++			state[key] = st
++			if reason == "" || !c.Auto || strings.TrimSpace(c.DSKey) == "" || actions >= c.MaxActionsPerRun {
++				continue
++			}
++			parts := make([]string, 0, 4)
++			if len(c.HostPromptAllList) > 0 {
++				for _, p := range c.HostPromptAllList {
++					if strings.TrimSpace(p) != "" {
++						parts = append(parts, p)
++					}
++				}
++			} else if strings.TrimSpace(c.HostPromptAll) != "" {
++				parts = append(parts, c.HostPromptAll)
++			}
++			list := c.HostPromptList[pkey]
++			if len(list) == 0 {
++				list = c.HostPromptList[key]
++			}
++			if len(list) > 0 {
++				for _, p := range list {
++					if strings.TrimSpace(p) != "" {
++						parts = append(parts, p)
++					}
++				}
++			} else if p := strings.TrimSpace(c.HostPrompts[pkey]); p != "" {
++				parts = append(parts, p)
++			} else if p := strings.TrimSpace(c.HostPrompts[key]); p != "" {
++				parts = append(parts, p)
++			}
++			hp := strings.Join(parts, "\n\n")
++			act, ae := r.repairAskDeepSeek(ctx, c, h, hosts, res, mbps, base, reason, hp, pname(p), pkey)
++			if ae != nil || act.Action == "" || act.Action == "noop" {
++				continue
++			}
++			before := repairDeepCopy(h)
++			detail := r.repairChangeDetail(act, before, h)
++			if err := r.repairApply(ctx, tok, cli, h, hosts, act); err != nil {
++				r.repairLogAdd(repairLogEntry{TS: time.Now().Unix(), Key: key, Panel: pname(p), Host: strv(h["address"]), Remark: strv(h["remark"]), Action: act.Action, Value: act.Value, Reason: act.Reason, Result: "apply_failed: " + truncRune(err.Error(), 120), Detail: detail, Latency: res.MedianMS, Mbps: mbps, Baseline: base})
++				continue
++			}
++			actions++
++			time.Sleep(5 * time.Second)
++			nres := r.cfgTestOne(ctx, link, cfgOpts{Samples: 2, Timeout: 12 * time.Second})
++			result := "ok"
++			if act.Action != "disable" && nres.Verdict == "fail" {
++				if rb := r.repairRollback(tok, cli, before); rb == nil {
++					result = "rolled_back"
++				} else {
++					result = "rollback_failed"
++				}
++			}
++			syncH := h
++			if result == "rolled_back" {
++				syncH = before
++			}
++			r.repairSyncHostCard(p.URL, strv(h["id"]), syncH)
++			st.LastAction = act.Action + " " + act.Value
++			st.LastActionTS = time.Now().Unix()
++			state[key] = st
++			r.repairLogAdd(repairLogEntry{TS: time.Now().Unix(), Key: key, Panel: pname(p), Host: strv(h["address"]), Remark: strv(h["remark"]), Action: act.Action, Value: act.Value, Reason: act.Reason, Result: result, Detail: detail, Latency: nres.MedianMS, Mbps: mbps, Baseline: base})
++			if r.Bot != nil {
++				msg := fmt.Sprintf("🛠 تعمیر خودکار\n%s (%s)\nاقدام: %s %s\nتغییر: %s\nنتیجه: %s\nعلت: %s", strv(h["remark"]), strv(h["address"]), act.Action, act.Value, detail, result, act.Reason)
++				_ = msg
++				go r.Bot.Send(r.AdminID, msg, nil)
++			}
++			r.repairStateSave(state)
++		}
++		r.repairStateSave(state)
++	}
++	r.repairStateSave(state)
++}
++
++func repairMedian(v []float64) float64 {
++	if len(v) == 0 {
++		return 0
++	}
++	x := append([]float64(nil), v...)
++	sort.Float64s(x)
++	return x[len(x)/2]
++}
++
++func repairDeepCopy(m map[string]any) map[string]any {
++	b, _ := json.Marshal(m)
++	out := map[string]any{}
++	_ = json.Unmarshal(b, &out)
++	return out
++}
++
++func repairMatchLink(h map[string]any, links []cfgLink) (cfgLink, bool) {
++	if len(links) == 0 {
++		return cfgLink{}, false
++	}
++	addrs := hfList(h["address"])
++	snis := append(hfList(h["sni"]), hfList(h["host"])...)
++	port := intOfAny(h["port"])
++	for _, l := range links {
++		for _, a := range addrs {
++			if a != "" && strings.EqualFold(l.Host, a) && (port == 0 || l.Port == port) {
++				return l, true
++			}
++		}
++	}
++	for _, l := range links {
++		for _, s := range snis {
++			if s != "" && strings.EqualFold(l.Host, s) {
++				return l, true
++			}
++		}
++	}
++	return cfgLink{}, false
++}
++
++func repairCandidates(h map[string]any, all []map[string]any) map[string][]string {
++	seen := map[string]map[string]bool{}
++	add := func(field, v string) {
++		v = strings.TrimSpace(v)
++		if v == "" {
++			return
++		}
++		if seen[field] == nil {
++			seen[field] = map[string]bool{}
++		}
++		if len(seen[field]) < 12 {
++			seen[field][v] = true
++		}
++	}
++	for _, val := range hfList(h["sni"]) {
++		add("sni", val)
++	}
++	for _, val := range hfList(h["host"]) {
++		add("host", val)
++	}
++	for _, val := range hfList(h["address"]) {
++		add("address", val)
++	}
++	add("port", strconv.Itoa(intOfAny(h["port"])))
++	for _, o := range all {
++		if strv(o["inbound_tag"]) != strv(h["inbound_tag"]) {
++			continue
++		}
++		for _, val := range hfList(o["sni"]) {
++			add("sni", val)
++		}
++		for _, val := range hfList(o["host"]) {
++			add("host", val)
++		}
++		for _, val := range hfList(o["address"]) {
++			add("address", val)
++		}
++		if p := intOfAny(o["port"]); p > 0 {
++			add("port", strconv.Itoa(p))
++		}
++	}
++	out := map[string][]string{}
++	for k, m := range seen {
++		for v := range m {
++			out[k] = append(out[k], v)
++		}
++		sort.Strings(out[k])
++	}
++	return out
++}
++
++func (r *Router) repairAskDeepSeek(ctx context.Context, c repairCfg, h map[string]any, all []map[string]any, res cfgResult, mbps, base float64, why, hostPrompt, panelName, selfKey string) (act repairAction, err error) {
++	var sys, request, response string
++	defer func() {
++		if r == nil {
++			return
++		}
++		addr := ""
++		if a := hfList(h["address"]); len(a) > 0 {
++			addr = a[0]
++		}
++		e := repairChatEntry{
++			TS: time.Now().Unix(), Kind: "auto", Panel: panelName,
++			HostID: strv(h["id"]), HostRemark: strv(h["remark"]), HostAddr: addr, Port: intOfAny(h["port"]),
++			Model: c.DSModel, Latency: res.MedianMS, Mbps: mbps, Why: why,
++			System: truncRune(sys, 20000), Request: truncRune(request, 20000), Response: truncRune(response, 10000),
++			Action: act.Action, Value: act.Value, Reason: act.Reason,
++		}
++		if err != nil {
++			e.Error = truncRune(err.Error(), 300)
++		}
++		go r.repairChatAdd(e)
++	}()
++	cands := repairCandidates(h, all)
++	sys = c.Prompt + "\n\nاقدامات مجاز: set_sni, set_host, set_address, set_port, restart_xray, disable, enable, noop. مقدار set_* فقط از candidates همان فیلد. اگر مقدار ssh_ready در host برابر false بود یا SSH برای ری‌استارت مطمئن نیست، restart_xray را انتخاب نکن."
++	if strings.TrimSpace(hostPrompt) != "" {
++		sys += "\n\nپرامپت این هاست:\n" + hostPrompt
++	}
++	sys = repairAppendPromptRefs(c, sys, selfKey)
++	addr := ""
++	if a := hfList(h["address"]); len(a) > 0 {
++		addr = a[0]
++	}
++	payload := map[string]any{
++		"host": map[string]any{
++			"remark": strv(h["remark"]), "address": hfList(h["address"]), "port": intOfAny(h["port"]),
++			"sni": hfList(h["sni"]), "host": hfList(h["host"]), "security": strv(h["security"]),
++			"inbound_tag": strv(h["inbound_tag"]), "path": strv(h["path"]), "is_disabled": h["is_disabled"],
++			"ssh_ready": r.repairSSHReady(addr),
++		},
++		"metrics":    map[string]any{"verdict": res.Verdict, "median_ms": res.MedianMS, "loss": res.Loss, "mbps": mbps, "baseline_mbps": base, "reason": why},
++		"candidates": cands,
++	}
++	jb, _ := json.Marshal(payload)
++	request = string(jb)
++	body := map[string]any{
++		"model": c.DSModel, "temperature": 0,
++		"response_format": map[string]any{"type": "json_object"},
++		"messages": []map[string]any{
++			{"role": "system", "content": sys},
++			{"role": "user", "content": string(jb)},
++		},
++	}
++	bb, _ := json.Marshal(body)
++	baseURL := strings.TrimRight(c.DSBase, "/")
++	if baseURL == "" {
++		baseURL = "https://api.deepseek.com"
++	}
++	req, e := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(bb))
++	if e != nil {
++		return repairAction{}, e
++	}
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set("Authorization", "Bearer "+c.DSKey)
++	hc := &http.Client{Timeout: 45 * time.Second}
++	resp, e := hc.Do(req)
++	if e != nil {
++		return repairAction{}, e
++	}
++	defer resp.Body.Close()
++	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	response = strings.TrimSpace(string(rb))
++	if resp.StatusCode >= 300 {
++		return repairAction{}, fmt.Errorf("deepseek HTTP %d", resp.StatusCode)
++	}
++	var out struct {
++		Choices []struct {
++			Message struct {
++				Content string `json:"content"`
++			} `json:"message"`
++		} `json:"choices"`
++	}
++	if e := json.Unmarshal(rb, &out); e != nil || len(out.Choices) == 0 {
++		return repairAction{}, fmt.Errorf("پاسخ DeepSeek نامعتبر")
++	}
++	response = strings.TrimSpace(out.Choices[0].Message.Content)
++	content := response
++	if i := strings.Index(content, "{"); i >= 0 {
++		if j := strings.LastIndex(content, "}"); j > i {
++			content = content[i : j+1]
++		}
++	}
++	if e := json.Unmarshal([]byte(content), &act); e != nil {
++		return repairAction{}, fmt.Errorf("JSON اقدام نامعتبر")
++	}
++	act.Action = strings.ToLower(strings.TrimSpace(act.Action))
++	act.Value = strings.TrimSpace(act.Value)
++	return act, nil
++}
++
++var repairValueRe = regexp.MustCompile(`^[A-Za-z0-9._:\-]{1,253}$`)
++
++func (r *Router) repairApply(ctx context.Context, tok string, cli interface {
++	PutHost(string, string, map[string]any) error
++}, h map[string]any, all []map[string]any, act repairAction) error {
++	id := strv(h["id"])
++	if id == "" {
++		return fmt.Errorf("host id خالی")
++	}
++	cands := repairCandidates(h, all)
++	inCands := func(field, v string) bool {
++		for _, x := range cands[field] {
++			if strings.EqualFold(x, v) {
++				return true
++			}
++		}
++		return false
++	}
++	switch act.Action {
++	case "set_sni", "set_host", "set_address":
++		field := strings.TrimPrefix(act.Action, "set_")
++		if !repairValueRe.MatchString(act.Value) || !inCands(field, act.Value) {
++			return fmt.Errorf("مقدار %s مجاز نیست", act.Value)
++		}
++		h[field] = []string{act.Value}
++	case "set_port":
++		p, err := strconv.Atoi(act.Value)
++		if err != nil || p < 1 || p > 65535 || !inCands("port", strconv.Itoa(p)) {
++			return fmt.Errorf("پورت مجاز نیست")
++		}
++		h["port"] = p
++	case "disable":
++		h["is_disabled"] = true
++	case "enable":
++		h["is_disabled"] = false
++	case "restart_xray":
++		addr := cfgFirst(hfList(h["address"])...)
++		if addr == "" {
++			return fmt.Errorf("آدرس هاست خالی")
++		}
++		if err := r.repairRestartXray(addr); err != nil {
++			return err
++		}
++		return nil
++	default:
++		return fmt.Errorf("اقدام ناشناخته")
++	}
++	return cli.PutHost(tok, id, h)
++}
++
++func (r *Router) repairRollback(tok string, cli interface {
++	PutHost(string, string, map[string]any) error
++}, before map[string]any) error {
++	id := strv(before["id"])
++	if id == "" {
++		return fmt.Errorf("no id")
++	}
++	return cli.PutHost(tok, id, before)
++}
++
++func (r *Router) repairFindServer(addr string) map[string]any {
++	addr = strings.TrimSpace(addr)
++	if addr == "" {
++		return nil
++	}
++	for _, s := range r.srvList() {
++		host := strings.TrimSpace(strv(s["host"]))
++		if host != "" && strings.EqualFold(host, addr) {
++			return s
++		}
++		// Notes are a comma-separated list of the config addresses served by
++		// this SSH target; compare whole entries, never substrings.
++		for _, part := range strings.Split(strv(s["note"]), ",") {
++			if strings.EqualFold(strings.TrimSpace(part), addr) {
++				return s
++			}
++		}
++	}
++	return nil
++}
++
++func (r *Router) repairSSHReady(addr string) bool { return r.repairFindServer(addr) != nil }
++
++// repairChangeDetail records exactly what the feature changed on the panel
++// host or on the exit server, so the history is a change log, not just a list
++// of proposed actions.
++func (r *Router) repairChangeDetail(act repairAction, before, after map[string]any) string {
++	switch act.Action {
++	case "set_sni", "set_host", "set_address":
++		field := strings.TrimPrefix(act.Action, "set_")
++		old := strings.Join(hfList(before[field]), ", ")
++		if old == "" {
++			old = "—"
++		}
++		return fmt.Sprintf("%s: %s → %s", field, old, act.Value)
++	case "set_port":
++		return fmt.Sprintf("port: %s → %s", strv(before["port"]), act.Value)
++	case "disable", "enable":
++		return fmt.Sprintf("is_disabled: %v → %v", boolVal(before["is_disabled"]), act.Action == "disable")
++	case "restart_xray":
++		addr := ""
++		if a := hfList(after["address"]); len(a) > 0 {
++			addr = a[0]
++		}
++		target := addr
++		if s := r.repairFindServer(addr); s != nil {
++			target = strv(s["host"])
++			if name := strv(s["name"]); name != "" {
++				target += " (" + name + ")"
++			}
++		}
++		if target == "" {
++			target = "نامشخص"
++		}
++		return "ری‌استارت Xray روی سرور خروجی " + target
++	}
++	return ""
++}
++
++func (r *Router) repairRestartXray(addr string) error {
++	s := r.repairFindServer(addr)
++	if s == nil {
++		return fmt.Errorf("سرور SSH برای %s پیدا نشد", strings.TrimSpace(addr))
++	}
++	res := r.srvSSH(s, "systemctl restart xray 2>&1 || systemctl restart xray-core 2>&1 || true")
++	if res.Ok {
++		return nil
++	}
++	return fmt.Errorf("%s", truncRune(res.Err, 120))
++}
++
++func repairThroughput(ctx context.Context, c cfgLink, want int) (float64, error) {
++	if want <= 0 {
++		want = 1000000
++	}
++	bin := cfgEnginePath()
++	port, err := cfgFreePort()
++	if err != nil {
++		return 0, err
++	}
++	dir, err := os.MkdirTemp("", "repair-")
++	if err != nil {
++		return 0, err
++	}
++	defer os.RemoveAll(dir)
++	cfgPath := filepath.Join(dir, "config.json")
++	body, _ := json.Marshal(cfgBuildConfig(c, port))
++	if err := os.WriteFile(cfgPath, body, 0o600); err != nil {
++		return 0, err
++	}
++	rctx, cancel := context.WithCancel(ctx)
++	defer cancel()
++	var logs lockedBuf
++	cmd := exec.CommandContext(rctx, bin, "run", "-c", cfgPath)
++	cmd.Stderr = &logs
++	cmd.Stdout = &logs
++	if err := cmd.Start(); err != nil {
++		return 0, err
++	}
++	done := make(chan struct{})
++	go func() { _ = cmd.Wait(); close(done) }()
++	defer func() { cancel(); <-done }()
++	proxy := "127.0.0.1:" + strconv.Itoa(port)
++	ready := false
++	for i := 0; i < 80; i++ {
++		select {
++		case <-done:
++			return 0, fmt.Errorf("engine start failed")
++		case <-time.After(50 * time.Millisecond):
++		}
++		cc, e := net.DialTimeout("tcp", proxy, 300*time.Millisecond)
++		if e == nil {
++			cc.Close()
++			ready = true
++			break
++		}
++	}
++	if !ready {
++		return 0, fmt.Errorf("engine not ready")
++	}
++	target := fmt.Sprintf("https://speed.cloudflare.com/__down?bytes=%d", want)
++	u, err := url.Parse(target)
++	if err != nil {
++		return 0, err
++	}
++	tr := &http.Transport{
++		DisableKeepAlives: true,
++		DialContext: func(dctx context.Context, _, _ string) (net.Conn, error) {
++			return cfgSocksDial(dctx, proxy, u.Hostname(), 443)
++		},
++	}
++	defer tr.CloseIdleConnections()
++	hc := &http.Client{Transport: tr, Timeout: 25 * time.Second}
++	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
++	start := time.Now()
++	resp, err := hc.Do(req)
++	if err != nil {
++		return 0, err
++	}
++	defer resp.Body.Close()
++	n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, int64(want)))
++	el := time.Since(start).Seconds()
++	if n < 1024 || el <= 0 {
++		return 0, fmt.Errorf("download too small")
++	}
++	return float64(n) * 8 / el / 1e6, nil
++}
++
++func (r *Router) webRepairGet(w http.ResponseWriter, req *http.Request, uid int64) {
++	c := r.repairCfg()
++	cfgOut := map[string]any{
++		"enabled": c.Enabled, "auto": c.Auto, "intervalMin": c.IntervalMin,
++		"deepseekBase": c.DSBase, "deepseekModel": c.DSModel, "hasKey": c.DSKey != "",
++		"prompt": c.Prompt, "promptIDs": c.PromptIDs, "hostPromptItemIDs": c.HostPromptItemIDs, "testUsers": c.TestUsers, "hostPrompts": c.HostPrompts, "hostPromptList": c.HostPromptList, "hostPromptAll": c.HostPromptAll, "hostPromptAllList": c.HostPromptAllList,
++		"minMbps": c.MinMbps, "maxLatencyMs": c.MaxLatencyMs, "dropPct": c.DropPct,
++		"throughputBytes": c.ThroughputBytes, "throughputEveryMin": c.ThroughputEveryMin,
++		"maxActionsPerRun": c.MaxActionsPerRun,
++	}
++	panels := []map[string]any{}
++	for i, p := range r.PanelsRaw() {
++		user := c.TestUsers[repairPanelKey(p.URL)]
++		if user == "" {
++			user = c.TestUsers[strconv.Itoa(i)]
++		}
++		panels = append(panels, map[string]any{"index": i, "name": pname(p), "url": p.URL, "user": user})
++	}
++	webOK(w, map[string]any{"cfg": cfgOut, "panels": panels, "state": r.repairStateLoad(), "log": r.repairLog(), "hosts": r.repairPruneHosts()})
++}
++
++func (r *Router) webRepairSave(w http.ResponseWriter, req *http.Request, uid int64) {
++	var in repairCfg
++	if !webDecode(w, req, &in) {
++		return
++	}
++	old := r.repairCfg()
++	if strings.TrimSpace(in.DSKey) == "" {
++		in.DSKey = old.DSKey
++	}
++	if in.DSBase == "" {
++		in.DSBase = old.DSBase
++	}
++	if !repairModelOK(in.DSModel) {
++		in.DSModel = old.DSModel
++		if !repairModelOK(in.DSModel) {
++			in.DSModel = "deepseek-flash"
++		}
++	}
++	if in.Prompt == "" {
++		in.Prompt = old.Prompt
++	}
++	if in.IntervalMin <= 0 {
++		in.IntervalMin = 5
++	}
++	if in.ThroughputEveryMin <= 0 {
++		in.ThroughputEveryMin = 30
++	}
++	if in.MaxActionsPerRun <= 0 {
++		in.MaxActionsPerRun = 3
++	}
++	repairEnsurePromptIDs(&in)
++	r.repairCfgSave(in)
++	webOK(w, map[string]any{"ok": true, "promptIDs": in.PromptIDs})
++}
++
++func (r *Router) webRepairRun(w http.ResponseWriter, req *http.Request, uid int64) {
++	c := r.repairCfg()
++	if !repairBusy.CompareAndSwap(false, true) {
++		webErr(w, http.StatusConflict, "یک اجرا در جریان است")
++		return
++	}
++	r.Store.Put(repairLastKey, strconv.FormatInt(time.Now().Unix(), 10), 0)
++	go func() {
++		defer repairBusy.Store(false)
++		r.repairRun(c)
++	}()
++	webOK(w, map[string]any{"ok": true, "started": true})
++}
++
++func (r *Router) webRepairHist(w http.ResponseWriter, req *http.Request, uid int64) {
++	webOK(w, map[string]any{"log": r.repairLog()})
++}
++
++func (r *Router) webRepairChat(w http.ResponseWriter, req *http.Request, uid int64) {
++	webOK(w, map[string]any{"chats": r.repairChatList()})
++}
++
++// webRepairChatReset clears the persisted chat of one config (or all when the
++// filter is empty). It never touches the panel or the repair history.
++func (r *Router) webRepairChatReset(w http.ResponseWriter, req *http.Request, uid int64) {
++	var in struct {
++		Panel  string `json:"panel"`
++		HostID string `json:"hostId"`
++		All    bool   `json:"all"`
++	}
++	if !webDecode(w, req, &in) {
++		return
++	}
++	list := r.repairChatList()
++	if in.All || (strings.TrimSpace(in.Panel) == "" && strings.TrimSpace(in.HostID) == "") {
++		r.Store.PutJSON(repairChatKey, []repairChatEntry{}, 0)
++		r.repairAgentSessionClear()
++		webOK(w, map[string]any{"ok": true})
++		return
++	}
++	kept := make([]repairChatEntry, 0, len(list))
++	for _, e := range list {
++		if e.Panel == in.Panel && e.HostID == in.HostID {
++			continue
++		}
++		kept = append(kept, e)
++	}
++	r.Store.PutJSON(repairChatKey, kept, 0)
++	r.repairAgentSessionDel(in.Panel, in.HostID)
++	webOK(w, map[string]any{"ok": true, "removed": len(list) - len(kept)})
++}
++
++func repairChatSystem(c repairCfg, pi int, panelName, panelURL string, h map[string]any) string {
++	var b strings.Builder
++	b.WriteString("تو دستیار هوش مصنوعی «نگهبان ابری» هستی. فارسی، کوتاه و عملی جواب بده و اگر اطلاعات کافی نیست صادقانه بگو.\n")
++	b.WriteString("پنل: " + panelName + "\n")
++	b.WriteString("کانفیگ: " + strv(h["remark"]) + "\n")
++	b.WriteString(fmt.Sprintf("آدرس: %s · پورت: %d · SNI: %s · امنیت: %s · Inbound: %s · غیرفعال: %v\n",
++		strings.Join(hfList(h["address"]), ", "), intOfAny(h["port"]), strings.Join(hfList(h["sni"]), ", "),
++		strv(h["security"]), strv(h["inbound_tag"]), h["is_disabled"]))
++	if strings.TrimSpace(c.Prompt) != "" {
++		b.WriteString("\nقواعد کلی:\n" + c.Prompt + "\n")
++	}
++	shared := []string{}
++	if len(c.HostPromptAllList) > 0 {
++		for _, x := range c.HostPromptAllList {
++			if strings.TrimSpace(x) != "" {
++				shared = append(shared, x)
++			}
++		}
++	} else if strings.TrimSpace(c.HostPromptAll) != "" {
++		shared = append(shared, c.HostPromptAll)
++	}
++	if len(shared) > 0 {
++		b.WriteString("\nپرامپت‌های مشترک:\n" + strings.Join(shared, "\n\n") + "\n")
++	}
++	key := repairHostKey(panelURL, strv(h["id"]))
++	oldKey := fmt.Sprintf("%d:%s", pi, strv(h["id"]))
++	prompts := c.HostPromptList[key]
++	if len(prompts) == 0 {
++		prompts = c.HostPromptList[oldKey]
++	}
++	own := []string{}
++	for _, x := range prompts {
++		if strings.TrimSpace(x) != "" {
++			own = append(own, x)
++		}
++	}
++	if len(own) == 0 {
++		single := strings.TrimSpace(c.HostPrompts[key])
++		if single == "" {
++			single = strings.TrimSpace(c.HostPrompts[oldKey])
++		}
++		if single != "" {
++			own = append(own, single)
++		}
++	}
++	if len(own) > 0 {
++		b.WriteString("\nپرامپت‌های این کانفیگ:\n" + strings.Join(own, "\n\n") + "\n")
++	}
++	body := repairAppendPromptRefs(c, b.String(), key)
++	b.Reset()
++	b.WriteString(body)
++	b.WriteString("\nاگر در پیام کاربر شناسه‌ای مثل #G یا #P8883.1 دیدی، متن پرامپت ارجاع‌شده در ادامهٔ همان پیام آمده است؛ از آن استفاده کن.\n")
++	b.WriteString("\nقاعدهٔ این چت: فقط به فارسی و متنی پاسخ بده؛ خروجی JSON نده. قاعدهٔ JSON مربوط به تصمیم‌گیری خودکار است، نه این گفت‌وگو. اگر کاربر دستور اجرایی خواست، فقط پیشنهادت را توضیح بده.\n")
++	return b.String()
++}
++
++func (r *Router) repairChatDeepSeek(ctx context.Context, c repairCfg, sys string, history []map[string]any, user string) (string, error) {
++	messages := make([]map[string]any, 0, len(history)+2)
++	messages = append(messages, map[string]any{"role": "system", "content": sys})
++	messages = append(messages, history...)
++	messages = append(messages, map[string]any{"role": "user", "content": user})
++	body := map[string]any{
++		"model": c.DSModel, "temperature": 0.3,
++		"messages": messages,
++	}
++	bb, _ := json.Marshal(body)
++	baseURL := strings.TrimRight(c.DSBase, "/")
++	if baseURL == "" {
++		baseURL = "https://api.deepseek.com"
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(bb))
++	if err != nil {
++		return "", err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set("Authorization", "Bearer "+c.DSKey)
++	hc := &http.Client{Timeout: 60 * time.Second}
++	resp, err := hc.Do(req)
++	if err != nil {
++		return "", err
++	}
++	defer resp.Body.Close()
++	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	if resp.StatusCode >= 300 {
++		return "", fmt.Errorf("deepseek HTTP %d", resp.StatusCode)
++	}
++	var out struct {
++		Choices []struct {
++			Message struct {
++				Content string `json:"content"`
++			} `json:"message"`
++		} `json:"choices"`
++	}
++	if err := json.Unmarshal(rb, &out); err != nil || len(out.Choices) == 0 {
++		return "", fmt.Errorf("پاسخ DeepSeek نامعتبر")
++	}
++	return strings.TrimSpace(out.Choices[0].Message.Content), nil
++}
++
++func (r *Router) webRepairChatSend(w http.ResponseWriter, req *http.Request, uid int64) {
++	var in struct {
++		Index   int    `json:"idx"`
++		HostID  string `json:"hostId"`
++		Message string `json:"message"`
++	}
++	if !webDecode(w, req, &in) {
++		return
++	}
++	msg := strings.TrimSpace(in.Message)
++	hid := strings.TrimSpace(in.HostID)
++	if msg == "" || hid == "" {
++		webErr(w, http.StatusBadRequest, "متن یا کانفیگ خالی است")
++		return
++	}
++	panels := r.PanelsRaw()
++	if in.Index < 0 || in.Index >= len(panels) {
++		webErr(w, http.StatusBadRequest, "پنل پیدا نشد")
++		return
++	}
++	p := panels[in.Index]
++	cli := p.Client()
++	tok, err := repairCachedToken(p.URL+"|"+p.Username, cli.Login)
++	if err != nil {
++		webErr(w, http.StatusBadGateway, "ورود به پنل ناموفق: "+truncRune(err.Error(), 120))
++		return
++	}
++	raw, err := cli.Hosts(tok)
++	if err != nil {
++		webErr(w, http.StatusBadGateway, "خواندن کانفیگ‌ها ناموفق: "+truncRune(err.Error(), 120))
++		return
++	}
++	var host map[string]any
++	for _, hv := range raw {
++		if m, ok := hv.(map[string]any); ok && strv(m["id"]) == hid {
++			host = m
++			break
++		}
++	}
++	if host == nil {
++		webErr(w, http.StatusNotFound, "کانفیگ در پنل پیدا نشد")
++		return
++	}
++	c := r.repairCfg()
++	sys := repairChatSystem(c, in.Index, pname(p), p.URL, host)
++	if si, se := cli.System(tok); se == nil {
++		sys += fmt.Sprintf("\nاطلاعات زندهٔ پنل: نسخه %s · کاربران %d · آنلاین %d\n", si.Version, si.TotalUser, si.OnlineUsers)
++	}
++	refs := repairUserPromptRefs(c, msg)
++	chatUser := msg
++	if refs != "" {
++		chatUser = msg + "\n\n" + refs
++	}
++	// This config's own conversation is the memory of the chat. The main and
++	// shared prompts live in sys; reset deletes these rows, which is what makes
++	// "reset" start a fresh chat.
++	hist := make([]repairChatEntry, 0, 16)
++	for _, e := range r.repairChatList() {
++		if e.Kind == "manual" && e.Panel == pname(p) && e.HostID == hid {
++			hist = append(hist, e)
++		}
++	}
++	for i, j := 0, len(hist)-1; i < j; i, j = i+1, j-1 {
++		hist[i], hist[j] = hist[j], hist[i]
++	}
++	if len(hist) > 12 {
++		hist = hist[len(hist)-12:]
++	}
++	history := make([]map[string]any, 0, len(hist)*2)
++	for _, e := range hist {
++		ut := strings.TrimSpace(e.UserText)
++		if ut == "" {
++			ut = strings.TrimSpace(e.Request)
++		}
++		if e.Context != "" {
++			ut += "\n\n" + e.Context
++		}
++		if ut != "" {
++			history = append(history, map[string]any{"role": "user", "content": truncRune(ut, 8000)})
++		}
++		if strings.TrimSpace(e.Response) != "" {
++			history = append(history, map[string]any{"role": "assistant", "content": truncRune(e.Response, 4000)})
++		}
++	}
++	// Let the chat know what the automatic repair already did for this config.
++	autos := make([]repairChatEntry, 0, 5)
++	for _, e := range r.repairChatList() {
++		if e.Kind == "auto" && e.Panel == pname(p) && e.HostID == hid {
++			autos = append(autos, e)
++		}
++	}
++	for i, j := 0, len(autos)-1; i < j; i, j = i+1, j-1 {
++		autos[i], autos[j] = autos[j], autos[i]
++	}
++	if len(autos) > 5 {
++		autos = autos[len(autos)-5:]
++	}
++	for _, e := range autos {
++		txt := "اقدام خودکار"
++		if e.Action != "" {
++			txt += ": " + e.Action
++		}
++		if e.Value != "" {
++			txt += " " + e.Value
++		}
++		if e.Reason != "" {
++			txt += " — " + e.Reason
++		}
++		if txt != "اقدام خودکار" {
++			history = append(history, map[string]any{"role": "assistant", "content": txt})
++		}
++	}
++	reply, ce := r.repairChatDeepSeek(req.Context(), c, sys, history, chatUser)
++	addr := ""
++	if a := hfList(host["address"]); len(a) > 0 {
++		addr = a[0]
++	}
++	act := repairAction{}
++	if i := strings.Index(reply, "{"); i >= 0 {
++		if j := strings.LastIndex(reply, "}"); j > i {
++			var a repairAction
++			if json.Unmarshal([]byte(reply[i:j+1]), &a) == nil {
++				act = a
++			}
++		}
++	}
++	entry := repairChatEntry{
++		TS: time.Now().Unix(), Kind: "manual", Panel: pname(p),
++		HostID: strv(host["id"]), HostRemark: strv(host["remark"]), HostAddr: addr, Port: intOfAny(host["port"]),
++		Model: c.DSModel, System: truncRune(sys, 20000), Request: msg, Response: truncRune(reply, 10000), UserText: msg, Context: truncRune(refs, 20000),
++		Action: act.Action, Value: act.Value, Reason: act.Reason,
++	}
++	if ce != nil {
++		entry.Error = truncRune(ce.Error(), 300)
++	}
++	r.repairChatAdd(entry)
++	if ce != nil {
++		webErr(w, http.StatusBadGateway, "پاسخ هوش مصنوعی ناموفق: "+truncRune(ce.Error(), 120))
++		return
++	}
++	webOK(w, map[string]any{"reply": reply, "chat": entry})
++}
++
++// webRepairTest runs a real health/throughput test for one host using the
++// panel test user's subscription link. It is intentionally read-only: it only
++// records latency/speed state; it never edits the panel.
++func (r *Router) webRepairTest(w http.ResponseWriter, req *http.Request, uid int64) {
++	var in struct {
++		Index  int    `json:"idx"`
++		HostID string `json:"hostId"`
++	}
++	if !webDecode(w, req, &in) {
++		return
++	}
++	hid := strings.TrimSpace(in.HostID)
++	panels := r.PanelsRaw()
++	if in.Index < 0 || in.Index >= len(panels) || hid == "" {
++		webErr(w, http.StatusBadRequest, "پنل یا کانفیگ پیدا نشد")
++		return
++	}
++	p := panels[in.Index]
++	cli := p.Client()
++	tok, err := repairCachedToken(p.URL+"|"+p.Username, cli.Login)
++	if err != nil {
++		webErr(w, http.StatusBadGateway, "ورود به پنل ناموفق: "+truncRune(err.Error(), 120))
++		return
++	}
++	raw, err := cli.Hosts(tok)
++	if err != nil {
++		webErr(w, http.StatusBadGateway, "خواندن کانفیگ‌ها ناموفق: "+truncRune(err.Error(), 120))
++		return
++	}
++	var host map[string]any
++	for _, hv := range raw {
++		if m, ok := hv.(map[string]any); ok && strv(m["id"]) == hid {
++			host = m
++			break
++		}
++	}
++	if host == nil {
++		webErr(w, http.StatusNotFound, "کانفیگ در پنل پیدا نشد")
++		return
++	}
++	c := r.repairCfg()
++	uname := strings.TrimSpace(c.TestUsers[repairPanelKey(p.URL)])
++	if uname == "" {
++		uname = strings.TrimSpace(c.TestUsers[strconv.Itoa(in.Index)])
++	}
++	links := []cfgLink{}
++	if uname != "" {
++		if uo := cli.User(tok, uname); uo != nil {
++			if sub := strv(uo["subscription_url"]); sub != "" {
++				if raws, se := cfgSubLinks(req.Context(), sub); se == nil {
++					for _, rawLink := range raws {
++						if l, pe := cfgParseLink(rawLink); pe == nil {
++							links = append(links, l)
++						}
++					}
++				}
++			}
++		}
++	}
++	link, ok := repairMatchLink(host, links)
++	if !ok {
++		webErr(w, http.StatusConflict, "لینک تست برای این کانفیگ پیدا نشد (یوزر تست/سابسکریپشن را چک کن)")
++		return
++	}
++	ctx, cancel := context.WithTimeout(req.Context(), 70*time.Second)
++	defer cancel()
++	res := r.cfgTestOne(ctx, link, cfgOpts{Samples: 2, Timeout: 10 * time.Second})
++	mbps := 0.0
++	if c.ThroughputBytes > 0 && res.Verdict != "fail" && ctx.Err() == nil {
++		tctx, tcancel := context.WithTimeout(req.Context(), 30*time.Second)
++		if v, te := repairThroughput(tctx, link, c.ThroughputBytes); te == nil {
++			mbps = v
++		}
++		tcancel()
++	}
++	st := r.repairStateLoad()
++	key := strconv.Itoa(in.Index) + ":" + hid
++	s := st[key]
++	s.LastCheck = time.Now().Unix()
++	s.Latency = res.MedianMS
++	if res.Verdict == "fail" {
++		s.Fails++
++	} else {
++		s.Fails = 0
++	}
++	if mbps > 0 {
++		s.Mbps = mbps
++		s.ThruTS = time.Now().Unix()
++	}
++	st[key] = s
++	r.repairStateSave(st)
++	webOK(w, map[string]any{
++		"host":     repairAgentHostAddr(host),
++		"remark":   strv(host["remark"]),
++		"testUser": uname,
++		"verdict":  res.Verdict,
++		"medianMs": res.MedianMS,
++		"loss":     res.Loss,
++		"mbps":     mbps,
++		"baseline": repairMedian(s.Base),
++		"at":       time.Now().Unix(),
++	})
++}
++
++// webRepairUsers powers the test-username picker: it searches the users that
++// actually exist inside one of the Pasarguard panels added under "پنل".
++func (r *Router) webRepairUsers(w http.ResponseWriter, req *http.Request, uid int64) {
++	idx, _ := strconv.Atoi(strings.TrimSpace(req.URL.Query().Get("idx")))
++	query := strings.TrimSpace(req.URL.Query().Get("q"))
++	panels := r.PanelsRaw()
++	if idx < 0 || idx >= len(panels) {
++		webErr(w, http.StatusBadRequest, "پنل پیدا نشد")
++		return
++	}
++	p := panels[idx]
++	cli := p.Client()
++	tok, err := repairCachedToken(p.URL+"|"+p.Username, cli.Login)
++	if err != nil {
++		webErr(w, http.StatusBadGateway, "ورود به پنل ناموفق: "+truncRune(err.Error(), 120))
++		return
++	}
++	users, total, err := cli.SearchUsers(tok, query, 30)
++	if err != nil {
++		webErr(w, http.StatusBadGateway, "خواندن یوزرها ناموفق: "+truncRune(err.Error(), 120))
++		return
++	}
++	webOK(w, map[string]any{"users": users, "total": total})
++}
++
++// webRepairUser returns the live volume of the selected test user so the UI can
++// show how much of its allowance is used.
++func (r *Router) webRepairUser(w http.ResponseWriter, req *http.Request, uid int64) {
++	idx, _ := strconv.Atoi(strings.TrimSpace(req.URL.Query().Get("idx")))
++	username := strings.TrimSpace(req.URL.Query().Get("username"))
++	if username == "" {
++		webErr(w, http.StatusBadRequest, "یوزرنیم خالی است")
++		return
++	}
++	panels := r.PanelsRaw()
++	if idx < 0 || idx >= len(panels) {
++		webErr(w, http.StatusBadRequest, "پنل پیدا نشد")
++		return
++	}
++	p := panels[idx]
++	cli := p.Client()
++	tok, err := repairCachedToken(p.URL+"|"+p.Username, cli.Login)
++	if err != nil {
++		webErr(w, http.StatusBadGateway, "ورود به پنل ناموفق: "+truncRune(err.Error(), 120))
++		return
++	}
++	u, ok := cli.UserUsage(tok, username)
++	if !ok {
++		webErr(w, http.StatusNotFound, "یوزر در این پنل پیدا نشد")
++		return
++	}
++	webOK(w, u)
++}
++
++// webRepairConfigs loads the hosts ("configs") of one panel so the repair page
++// can show what the selected panel actually exposes.
++func (r *Router) webRepairConfigs(w http.ResponseWriter, req *http.Request, uid int64) {
++	idx, _ := strconv.Atoi(strings.TrimSpace(req.URL.Query().Get("idx")))
++	panels := r.PanelsRaw()
++	if idx < 0 || idx >= len(panels) {
++		webErr(w, http.StatusBadRequest, "پنل پیدا نشد")
++		return
++	}
++	p := panels[idx]
++	cli := p.Client()
++	tok, err := repairCachedToken(p.URL+"|"+p.Username, cli.Login)
++	if err != nil {
++		webErr(w, http.StatusBadGateway, "ورود به پنل ناموفق: "+truncRune(err.Error(), 120))
++		return
++	}
++	raw, err := cli.Hosts(tok)
++	if err != nil {
++		webErr(w, http.StatusBadGateway, "خواندن کانفیگ‌ها ناموفق: "+truncRune(err.Error(), 120))
++		return
++	}
++	incoming := make([]map[string]any, 0, len(raw))
++	for _, hv := range raw {
++		h, ok := hv.(map[string]any)
++		if !ok {
++			continue
++		}
++		id := strv(h["id"])
++		incoming = append(incoming, map[string]any{
++			"key":         p.URL + "#" + id,
++			"panelName":   pname(p),
++			"panelUrl":    p.URL,
++			"id":          id,
++			"remark":      strv(h["remark"]),
++			"disabled":    boolVal(h["is_disabled"]),
++			"address":     hfList(h["address"]),
++			"port":        h["port"],
++			"sni":         hfList(h["sni"]),
++			"host":        hfList(h["host"]),
++			"path":        strv(h["path"]),
++			"security":    strv(h["security"]),
++			"inbound_tag": strv(h["inbound_tag"]),
++		})
++	}
++	// Replace this panel's previous entries, keep the other panels' cards.
++	merged := make([]map[string]any, 0, len(incoming)+len(raw))
++	for _, h := range r.repairHosts() {
++		if strv(h["panelUrl"]) == p.URL {
++			continue
++		}
++		merged = append(merged, h)
++	}
++	merged = append(merged, incoming...)
++	r.Store.PutJSON(repairHostsKey, merged, 0)
++	webOK(w, map[string]any{
++		"panel": map[string]any{"name": pname(p), "url": p.URL},
++		"hosts": merged,
++		"total": len(merged),
++	})
++}
++
++// webRepairConfigsClear empties the persisted HOST list.
++func (r *Router) webRepairConfigsClear(w http.ResponseWriter, req *http.Request, uid int64) {
++	r.Store.PutJSON(repairHostsKey, []map[string]any{}, 0)
++	webOK(w, map[string]any{"ok": true})
++}
++
++// webRepairHost toggles one host's is_disabled flag on the panel and mirrors it
++// into the persisted HOST list.
++func (r *Router) webRepairHost(w http.ResponseWriter, req *http.Request, uid int64) {
++	var in struct {
++		Index    int    `json:"idx"`
++		ID       string `json:"id"`
++		Disabled bool   `json:"disabled"`
++	}
++	if !webDecode(w, req, &in) {
++		return
++	}
++	id := strings.TrimSpace(in.ID)
++	panels := r.PanelsRaw()
++	if in.Index < 0 || in.Index >= len(panels) || id == "" {
++		webErr(w, http.StatusBadRequest, "پنل یا کانفیگ پیدا نشد")
++		return
++	}
++	p := panels[in.Index]
++	cli := p.Client()
++	tok, err := repairCachedToken(p.URL+"|"+p.Username, cli.Login)
++	if err != nil {
++		webErr(w, http.StatusBadGateway, "ورود به پنل ناموفق: "+truncRune(err.Error(), 120))
++		return
++	}
++	raw, err := cli.Hosts(tok)
++	if err != nil {
++		webErr(w, http.StatusBadGateway, "خواندن کانفیگ‌ها ناموفق: "+truncRune(err.Error(), 120))
++		return
++	}
++	var target map[string]any
++	for _, hv := range raw {
++		if m, ok := hv.(map[string]any); ok && strv(m["id"]) == id {
++			target = m
++			break
++		}
++	}
++	if target == nil {
++		webErr(w, http.StatusNotFound, "کانفیگ در پنل پیدا نشد")
++		return
++	}
++	oldDisabled := boolVal(target["is_disabled"])
++	target["is_disabled"] = in.Disabled
++	if err := cli.PutHost(tok, id, target); err != nil {
++		webErr(w, http.StatusBadGateway, "تغییر وضعیت ناموفق: "+truncRune(err.Error(), 120))
++		return
++	}
++	list := r.repairHosts()
++	for _, h := range list {
++		if strv(h["panelUrl"]) == p.URL && strv(h["id"]) == id {
++			h["disabled"] = in.Disabled
++		}
++	}
++	r.Store.PutJSON(repairHostsKey, list, 0)
++	addr := ""
++	if a := hfList(target["address"]); len(a) > 0 {
++		addr = a[0]
++	}
++	act := "enable"
++	if in.Disabled {
++		act = "disable"
++	}
++	r.repairLogAdd(repairLogEntry{
++		TS: time.Now().Unix(), Key: repairHostKey(p.URL, id), Panel: pname(p),
++		Host: addr, Remark: strv(target["remark"]), Action: act, Result: "manual",
++		Detail: fmt.Sprintf("is_disabled: %v → %v (تغییر دستی)", oldDisabled, in.Disabled),
++	})
++	webOK(w, map[string]any{"ok": true, "disabled": in.Disabled})
++}
++
++func (r *Router) webRepairTestKey(w http.ResponseWriter, req *http.Request, uid int64) {
++	var in struct {
++		Key string `json:"key"`
++	}
++	if !webDecode(w, req, &in) {
++		return
++	}
++	c := r.repairCfg()
++	key := strings.TrimSpace(in.Key)
++	if key == "" {
++		key = strings.TrimSpace(c.DSKey)
++	}
++	if key == "" {
++		webErr(w, http.StatusBadRequest, "کلید API خالی است")
++		return
++	}
++	base := strings.TrimRight(c.DSBase, "/")
++	if base == "" {
++		base = "https://api.deepseek.com"
++	}
++	ctx, cancel := context.WithTimeout(req.Context(), 20*time.Second)
++	defer cancel()
++	hreq, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/models", nil)
++	if err != nil {
++		webErr(w, http.StatusBadRequest, err.Error())
++		return
++	}
++	hreq.Header.Set("Authorization", "Bearer "+key)
++	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(hreq)
++	if err != nil {
++		webErr(w, http.StatusBadGateway, "اتصال به DeepSeek ناموفق: "+truncRune(err.Error(), 120))
++		return
++	}
++	defer resp.Body.Close()
++	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
++	if resp.StatusCode != http.StatusOK {
++		webErr(w, http.StatusBadRequest, fmt.Sprintf("DeepSeek پاسخ %d داد: %s", resp.StatusCode, truncRune(strings.TrimSpace(string(b)), 180)))
++		return
++	}
++	webOK(w, map[string]any{"ok": true})
++}
++
++func (r *Router) webRepairPage(w http.ResponseWriter, req *http.Request) {
++	b, err := webuiFS.ReadFile("webui/repair/index.html")
++	if err != nil {
++		http.NotFound(w, req)
++		return
++	}
++	w.Header().Set("Content-Type", "text/html; charset=utf-8")
++	w.Header().Set("Cache-Control", "no-store, max-age=0")
++	_, _ = w.Write(b)
++}
+diff --git a/server/internal/router/repair_agent.go b/server/internal/router/repair_agent.go
+new file mode 100644
+index 0000000..f21a42b
+--- /dev/null
++++ b/server/internal/router/repair_agent.go
+@@ -0,0 +1,546 @@
++package router
++
++import (
++	"bufio"
++	"bytes"
++	"context"
++	"crypto/rand"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"os"
++	"os/exec"
++	"os/user"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync"
++	"syscall"
++	"time"
++
++	"github.com/aknuun/cg-server/internal/pg"
++)
++
++const (
++	repairAgentRoot       = "/opt/cloud-guardian/agent"
++	repairAgentHome       = repairAgentRoot + "/home"
++	repairAgentWorkspace  = repairAgentRoot + "/workspace"
++	repairAgentUser       = "ocagent"
++	repairAgentBin        = "/usr/local/bin/opencode"
++	repairAgentTimeout    = 12 * time.Minute
++	repairAgentSessionsKV = "repair_agent_sessions"
++)
++
++type repairAgentJob struct {
++	ID       string             `json:"id"`
++	Status   string             `json:"status"`
++	Reply    string             `json:"reply,omitempty"`
++	Error    string             `json:"error,omitempty"`
++	Steps    []string           `json:"steps,omitempty"`
++	Session  string             `json:"session,omitempty"`
++	Chat     repairChatEntry    `json:"chat,omitempty"`
++	Started  int64              `json:"started"`
++	Progress int                `json:"progress"`
++	Cancel   context.CancelFunc `json:"-"`
++}
++
++var (
++	repairAgentJobsMu sync.Mutex
++	repairAgentJobs   = map[string]*repairAgentJob{}
++)
++
++func (r *Router) setRepairAgentProgress(j *repairAgentJob, p int) {
++	if p < 0 {
++		p = 0
++	}
++	if p > 100 {
++		p = 100
++	}
++	repairAgentJobsMu.Lock()
++	if p > j.Progress {
++		j.Progress = p
++	}
++	repairAgentJobsMu.Unlock()
++}
++
++func repairAgentNewID() string {
++	var b [8]byte
++	_, _ = rand.Read(b[:])
++	return fmt.Sprintf("%d-%s", time.Now().UnixNano(), hex.EncodeToString(b[:]))
++}
++
++func repairAgentSessionKey(panelName, hostID string) string {
++	return strings.TrimSpace(panelName) + "|" + strings.TrimSpace(hostID)
++}
++
++func (r *Router) repairAgentSessions() map[string]string {
++	out := map[string]string{}
++	_ = r.Store.GetJSON(repairAgentSessionsKV, &out)
++	if out == nil {
++		out = map[string]string{}
++	}
++	return out
++}
++
++func (r *Router) repairAgentSessionGet(panelName, hostID string) string {
++	return strings.TrimSpace(r.repairAgentSessions()[repairAgentSessionKey(panelName, hostID)])
++}
++
++func (r *Router) repairAgentSessionSet(panelName, hostID, session string) {
++	if strings.TrimSpace(session) == "" {
++		return
++	}
++	m := r.repairAgentSessions()
++	m[repairAgentSessionKey(panelName, hostID)] = strings.TrimSpace(session)
++	r.Store.PutJSON(repairAgentSessionsKV, m, 0)
++}
++
++func (r *Router) repairAgentSessionDel(panelName, hostID string) {
++	m := r.repairAgentSessions()
++	delete(m, repairAgentSessionKey(panelName, hostID))
++	r.Store.PutJSON(repairAgentSessionsKV, m, 0)
++}
++
++func (r *Router) repairAgentSessionClear() {
++	r.Store.PutJSON(repairAgentSessionsKV, map[string]string{}, 0)
++}
++
++func repairAgentModel(c repairCfg) string {
++	m := strings.TrimSpace(c.DSModel)
++	if m == "" {
++		m = "deepseek-flash"
++	}
++	if !strings.HasPrefix(m, "deepseek/") {
++		m = "deepseek/" + m
++	}
++	return m
++}
++
++func repairAgentHostAddr(h map[string]any) string {
++	if a := hfList(h["address"]); len(a) > 0 {
++		return a[0]
++	}
++	return ""
++}
++
++func repairAgentContext(c repairCfg, idx int, p pg.Panel, h map[string]any, hist []repairChatEntry, msg string) string {
++	var b strings.Builder
++	b.WriteString("# CONTEXT — Cloud Guardian repair agent\n\n")
++	b.WriteString("You are running inside a sandbox on the same server as the production feature.\n")
++	b.WriteString("Read this file completely, then AGENTS.md, then perform the user's request.\n")
++	b.WriteString("Answer in Persian. Use the local feature API for real changes.\n\n")
++	b.WriteString("## Selected panel\n")
++	fmt.Fprintf(&b, "- index: %d\n- name: %s\n- url: %s\n", idx, pname(p), p.URL)
++	if u := c.TestUsers[repairPanelKey(p.URL)]; u != "" {
++		fmt.Fprintf(&b, "- test user: %s\n", u)
++	}
++	b.WriteString("\n## Selected configuration\n```json\n")
++	jb, _ := json.MarshalIndent(h, "", "  ")
++	b.Write(jb)
++	b.WriteString("\n```\n\n## Prompts (this configuration only)\n")
++	selKey := repairHostKey(p.URL, strv(h["id"]))
++	for _, d := range repairPromptDocs(c) {
++		if d.Key != "global" && !strings.HasPrefix(d.Key, "shared:") && d.Key != selKey && !strings.HasPrefix(d.Key, selKey+"::") {
++			continue
++		}
++		fmt.Fprintf(&b, "### [%s] %s\n%s\n\n", d.ID, d.Label, d.Text)
++	}
++	b.WriteString("## Prompt tags\n")
++	b.WriteString("The user may write #G, #S1, #P<hostID> or #P<hostID>.<n>; these map to the prompt labels above.\n")
++	b.WriteString("\n## Recent chat for this configuration\n")
++	if len(hist) == 0 {
++		b.WriteString("(empty)\n")
++	}
++	for _, e := range hist {
++		ut := strings.TrimSpace(e.UserText)
++		if ut == "" {
++			ut = strings.TrimSpace(e.Request)
++		}
++		if ut != "" {
++			fmt.Fprintf(&b, "- user: %s\n", truncRune(ut, 2000))
++		}
++		if strings.TrimSpace(e.Response) != "" {
++			fmt.Fprintf(&b, "- assistant: %s\n", truncRune(e.Response, 3000))
++		}
++	}
++	b.WriteString("\n## Feature API\n")
++	b.WriteString("Base: http://127.0.0.1:53128 — token: $CG_WEB_TOKEN (admin, valid for this run).\n")
++	b.WriteString("Use curl with `Authorization: Bearer $CG_WEB_TOKEN`.\n")
++	b.WriteString("Useful endpoints:\n")
++	b.WriteString("- GET /api/tools/repair  (panels, hosts, config, log)\n")
++	b.WriteString("- GET /api/tools/repair/configs?idx=N  (load/refresh panel configs)\n")
++	b.WriteString("- GET /api/tools/repair/users?idx=N&q=... and /user?idx=N&username=...\n")
++	b.WriteString("- POST /api/tools/repair/test {idx,hostId}  (REAL speed/health test; report verdict, medianMs, loss, mbps, baseline)\n")
++	b.WriteString("- POST /api/tools/repair/host {idx,id,disabled}  (toggle a config)\n")
++	b.WriteString("- POST /api/tools/repair/run  (run the repair engine now)\n")
++	b.WriteString("- GET /api/tools/repair/chat  (chat/history)\n")
++	b.WriteString("- POST /api/tools/repair/chat/reset {panel,hostId}\n")
++	b.WriteString("\n## Rules\n")
++	b.WriteString("- For any speed/health/test request, call the repair/test endpoint and report the real numbers.\n")
++	b.WriteString("- Never answer OK or claim success without a tool result. If a tool fails, report the actual error.\n")
++	b.WriteString("- For repair, call /api/tools/repair/run; for enable/disable, /api/tools/repair/host.\n")
++	b.WriteString("\n## Response style (MUST)\n")
++	b.WriteString("- Final answer max 5 short lines. Line 1: conclusion. Line 2: one raw evidence. Line 3: one next action or one question.\n")
++	b.WriteString("- No repetition, no generic network lectures, no raw tool logs/JSON.\n")
++	b.WriteString("- Respect user constraints: if they say do not change/restart a server or front, only config fields (SNI/Host/Address/Port/Path). If no config-level fix exists, say it in one line and ask; never suggest server changes.\n")
++	b.WriteString("- Answer the user's question directly; do not rerun tests unless needed.\n")
++	b.WriteString("\n## Sandbox\n")
++	b.WriteString("- Writable: /opt/cloud-guardian/agent/workspace (feature-server/, feature-webui/, custom-overlay/)\n")
++	b.WriteString("- Production /opt/cloud-guardian is read-only for this agent; do not modify production source/binary.\n")
++	b.WriteString("- Do not read /root or production secrets (config.json/data.db are root-only).\n")
++	b.WriteString("- Changes to the workspace source are not deployed automatically; say what must be deployed.\n")
++	b.WriteString("\n## User request\n")
++	b.WriteString(msg)
++	b.WriteString("\n")
++	return b.String()
++}
++
++type repairAgentEvent struct {
++	Type      string `json:"type"`
++	SessionID string `json:"sessionID"`
++	Part      struct {
++		Type  string          `json:"type"`
++		Text  string          `json:"text"`
++		Tool  string          `json:"tool"`
++		Title string          `json:"title"`
++		State json.RawMessage `json:"state"`
++	} `json:"part"`
++	Error json.RawMessage `json:"error"`
++}
++
++func (r *Router) runOpenCode(ctx context.Context, c repairCfg, session, contextPath, msg, token string, onStep func(string, int)) (string, []string, string, error) {
++	u, err := user.Lookup(repairAgentUser)
++	if err != nil {
++		return "", nil, "", fmt.Errorf("agent user: %w", err)
++	}
++	uid64, _ := strconv.ParseUint(u.Uid, 10, 32)
++	gid64, _ := strconv.ParseUint(u.Gid, 10, 32)
++	prompt := "ابتدا فایل " + contextPath + " و AGENTS.md را کامل بخوان. سپس درخواست کاربر را انجام بده.\n\n" + msg
++	args := []string{
++		"run", "--format", "json",
++		"--model", repairAgentModel(c),
++		"--auto",
++		"--dir", repairAgentWorkspace,
++	}
++	if strings.TrimSpace(session) != "" {
++		args = append(args, "--session", strings.TrimSpace(session))
++	}
++	args = append(args, prompt)
++	cmd := exec.CommandContext(ctx, repairAgentBin, args...)
++	cmd.Dir = repairAgentWorkspace
++	cmd.Env = []string{
++		"HOME=" + repairAgentHome,
++		"XDG_CONFIG_HOME=" + repairAgentHome + "/.config",
++		"XDG_DATA_HOME=" + repairAgentHome + "/.local/share",
++		"XDG_CACHE_HOME=" + repairAgentHome + "/.cache",
++		"DEEPSEEK_API_KEY=" + c.DSKey,
++		"CG_WEB_TOKEN=" + token,
++		"PATH=/usr/local/bin:/usr/local/go/bin:/usr/bin:/bin",
++		"TERM=dumb",
++		"NO_COLOR=1",
++		"PWD=" + repairAgentWorkspace,
++		"LANG=C.UTF-8",
++		"SHELL=/bin/bash",
++		"USER=" + repairAgentUser,
++		"LOGNAME=" + repairAgentUser,
++		"TMPDIR=/tmp",
++	}
++	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{
++		Uid: uint32(uid64), Gid: uint32(gid64), Groups: []uint32{uint32(gid64)},
++	}}
++	var stderr bytes.Buffer
++	stdout, err := cmd.StdoutPipe()
++	if err != nil {
++		return "", nil, "", fmt.Errorf("stdout pipe: %w", err)
++	}
++	cmd.Stderr = &stderr
++	if err := cmd.Start(); err != nil {
++		return "", nil, "", fmt.Errorf("start agent: %w", err)
++	}
++	scanner := bufio.NewScanner(stdout)
++	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
++	var texts, steps, stepTexts []string
++	newSession := ""
++	seenStep := map[string]bool{}
++	progress := 20
++	addStep := func(label string) {
++		label = strings.TrimSpace(label)
++		if label == "" || seenStep[label] {
++			return
++		}
++		seenStep[label] = true
++		steps = append(steps, label)
++		if progress < 90 {
++			progress += 5
++		}
++		if onStep != nil {
++			onStep(label, progress)
++		}
++	}
++	runErr := error(nil)
++	for scanner.Scan() {
++		line := strings.TrimSpace(scanner.Text())
++		if line == "" {
++			continue
++		}
++		var ev repairAgentEvent
++		if json.Unmarshal([]byte(line), &ev) != nil {
++			continue
++		}
++		if ev.SessionID != "" && newSession == "" {
++			newSession = ev.SessionID
++		}
++		switch ev.Type {
++		case "step_start":
++			stepTexts = nil
++		case "text":
++			t := strings.TrimSpace(ev.Part.Text)
++			if t != "" {
++				texts = append(texts, t)
++				stepTexts = append(stepTexts, t)
++				addStep("💭 " + truncRune(t, 180))
++			}
++		case "tool_use", "tool":
++			label := strings.TrimSpace(ev.Part.Tool)
++			var st struct {
++				Status string `json:"status"`
++				Title  string `json:"title"`
++			}
++			_ = json.Unmarshal(ev.Part.State, &st)
++			if st.Title != "" {
++				label += ": " + truncRune(st.Title, 160)
++			}
++			if label != "" {
++				addStep("🔧 " + label)
++			}
++		case "error":
++			if runErr == nil {
++				runErr = fmt.Errorf("%s", truncRune(string(ev.Error), 300))
++			}
++		}
++	}
++	waitErr := cmd.Wait()
++	if ctx.Err() != nil {
++		runErr = fmt.Errorf("timeout: %w", ctx.Err())
++	} else if waitErr != nil && runErr == nil {
++		runErr = waitErr
++	}
++	reply := strings.TrimSpace(strings.Join(stepTexts, "\n\n"))
++	if reply == "" {
++		reply = strings.TrimSpace(strings.Join(texts, "\n\n"))
++	}
++	if runErr != nil {
++		return reply, steps, newSession, fmt.Errorf("%v", runErr)
++	}
++	if reply == "" {
++		return reply, steps, newSession, fmt.Errorf("ایجنت پاسخی نداد")
++	}
++	return reply, steps, newSession, nil
++}
++
++func (r *Router) runRepairAgent(ctx context.Context, j *repairAgentJob, c repairCfg, idx int, p pg.Panel, h map[string]any, hist []repairChatEntry, msg, token string) {
++	ctxText := repairAgentContext(c, idx, p, h, hist, msg)
++	ctxPath := filepath.Join(repairAgentWorkspace, "CONTEXT-"+j.ID+".md")
++	if err := os.WriteFile(ctxPath, []byte(ctxText), 0o644); err != nil {
++		r.finishRepairAgent(j, repairChatEntry{}, ctxText, "", nil, fmt.Errorf("نوشتن CONTEXT ناموفق: %w", err))
++		return
++	}
++	session := r.repairAgentSessionGet(pname(p), strv(h["id"]))
++	r.setRepairAgentProgress(j, 15)
++	stop := make(chan struct{})
++	go func() {
++		p := 15
++		t := time.NewTicker(2 * time.Second)
++		defer t.Stop()
++		for {
++			select {
++			case <-stop:
++				return
++			case <-t.C:
++				if p < 90 {
++					p++
++					r.setRepairAgentProgress(j, p)
++				}
++			}
++		}
++	}()
++	reply, steps, newSession, err := r.runOpenCode(ctx, c, session, ctxPath, msg, token, func(label string, p int) {
++		repairAgentJobsMu.Lock()
++		if label != "" {
++			j.Steps = append(j.Steps, label)
++			if len(j.Steps) > 40 {
++				j.Steps = j.Steps[len(j.Steps)-40:]
++			}
++		}
++		if p > j.Progress {
++			j.Progress = p
++		}
++		repairAgentJobsMu.Unlock()
++	})
++	close(stop)
++	if newSession == "" {
++		newSession = session
++	}
++	if newSession != "" {
++		r.repairAgentSessionSet(pname(p), strv(h["id"]), newSession)
++	}
++	e := repairChatEntry{
++		TS: time.Now().Unix(), Kind: "manual", Panel: pname(p),
++		HostID: strv(h["id"]), HostRemark: strv(h["remark"]), HostAddr: repairAgentHostAddr(h), Port: intOfAny(h["port"]),
++		Model: repairAgentModel(c), System: truncRune(ctxText, 20000), Request: msg, UserText: msg,
++		Response: truncRune(reply, 10000),
++	}
++	r.finishRepairAgent(j, e, ctxText, newSession, steps, err)
++}
++
++func (r *Router) finishRepairAgent(j *repairAgentJob, e repairChatEntry, ctxText, session string, steps []string, err error) {
++	status := "ok"
++	errText := ""
++	if err != nil {
++		status = "error"
++		errText = truncRune(err.Error(), 1000)
++		e.Error = truncRune(err.Error(), 300)
++	}
++	if e.TS == 0 {
++		e.TS = time.Now().Unix()
++	}
++	repairAgentJobsMu.Lock()
++	canceled := j.Status == "canceled"
++	repairAgentJobsMu.Unlock()
++	if canceled {
++		repairAgentJobsMu.Lock()
++		j.Progress = 100
++		j.Status = "canceled"
++		repairAgentJobsMu.Unlock()
++		return
++	}
++	r.repairChatAdd(e)
++	repairAgentJobsMu.Lock()
++	j.Progress = 100
++	j.Status = status
++	j.Reply = e.Response
++	j.Error = errText
++	j.Steps = steps
++	j.Session = session
++	j.Chat = e
++	repairAgentJobsMu.Unlock()
++}
++
++func (r *Router) webRepairAgent(w http.ResponseWriter, req *http.Request, uid int64) {
++	var in struct {
++		Index   int    `json:"idx"`
++		HostID  string `json:"hostId"`
++		Message string `json:"message"`
++	}
++	if !webDecode(w, req, &in) {
++		return
++	}
++	msg := strings.TrimSpace(in.Message)
++	hid := strings.TrimSpace(in.HostID)
++	if msg == "" || hid == "" {
++		webErr(w, http.StatusBadRequest, "متن یا کانفیگ خالی است")
++		return
++	}
++	panels := r.PanelsRaw()
++	if in.Index < 0 || in.Index >= len(panels) {
++		webErr(w, http.StatusBadRequest, "پنل پیدا نشد")
++		return
++	}
++	p := panels[in.Index]
++	cli := p.Client()
++	tok, err := repairCachedToken(p.URL+"|"+p.Username, cli.Login)
++	if err != nil {
++		webErr(w, http.StatusBadGateway, "ورود به پنل ناموفق: "+truncRune(err.Error(), 120))
++		return
++	}
++	raw, err := cli.Hosts(tok)
++	if err != nil {
++		webErr(w, http.StatusBadGateway, "خواندن کانفیگ‌ها ناموفق: "+truncRune(err.Error(), 120))
++		return
++	}
++	var host map[string]any
++	for _, hv := range raw {
++		if m, ok := hv.(map[string]any); ok && strv(m["id"]) == hid {
++			host = m
++			break
++		}
++	}
++	if host == nil {
++		webErr(w, http.StatusNotFound, "کانفیگ در پنل پیدا نشد")
++		return
++	}
++	auth := strings.TrimSpace(req.Header.Get("Authorization"))
++	token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
++	if token == "" {
++		webErr(w, http.StatusUnauthorized, "توکن اجرا پیدا نشد")
++		return
++	}
++	c := r.repairCfg()
++	hist := make([]repairChatEntry, 0, 10)
++	list := r.repairChatList()
++	for i := len(list) - 1; i >= 0 && len(hist) < 10; i-- {
++		e := list[i]
++		if e.Kind == "manual" && e.Panel == pname(p) && e.HostID == hid {
++			hist = append(hist, e)
++		}
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), repairAgentTimeout)
++	j := &repairAgentJob{ID: repairAgentNewID(), Status: "running", Started: time.Now().Unix(), Progress: 5, Cancel: cancel}
++	repairAgentJobsMu.Lock()
++	repairAgentJobs[j.ID] = j
++	if len(repairAgentJobs) > 40 {
++		for id, old := range repairAgentJobs {
++			if old.Status != "running" && time.Since(time.Unix(old.Started, 0)) > time.Hour {
++				delete(repairAgentJobs, id)
++			}
++		}
++	}
++	repairAgentJobsMu.Unlock()
++	go r.runRepairAgent(ctx, j, c, in.Index, p, host, hist, msg, token)
++	webOK(w, map[string]any{"id": j.ID, "status": "running"})
++}
++
++func (r *Router) webRepairAgentCancel(w http.ResponseWriter, req *http.Request, uid int64) {
++	var in struct {
++		ID string `json:"id"`
++	}
++	if !webDecode(w, req, &in) {
++		return
++	}
++	id := strings.TrimSpace(in.ID)
++	repairAgentJobsMu.Lock()
++	j := repairAgentJobs[id]
++	if j != nil && j.Status == "running" {
++		j.Status = "canceled"
++		j.Progress = 100
++		if j.Cancel != nil {
++			j.Cancel()
++		}
++	}
++	repairAgentJobsMu.Unlock()
++	if j == nil {
++		webErr(w, http.StatusNotFound, "job پیدا نشد")
++		return
++	}
++	webOK(w, map[string]any{"ok": true, "status": "canceled"})
++}
++
++func (r *Router) webRepairAgentStatus(w http.ResponseWriter, req *http.Request, uid int64) {
++	id := strings.TrimSpace(req.URL.Query().Get("id"))
++	repairAgentJobsMu.Lock()
++	j := repairAgentJobs[id]
++	out := map[string]any{}
++	if j != nil {
++		out = map[string]any{
++			"id": j.ID, "status": j.Status, "reply": j.Reply, "error": j.Error,
++			"steps": j.Steps, "session": j.Session, "chat": j.Chat, "started": j.Started, "progress": j.Progress,
++		}
++	}
++	repairAgentJobsMu.Unlock()
++	if j == nil {
++		webErr(w, http.StatusNotFound, "job پیدا نشد")
++		return
++	}
++	webOK(w, out)
++}
+diff --git a/server/internal/router/repair_promptref_test.go b/server/internal/router/repair_promptref_test.go
+new file mode 100644
+index 0000000..a40b5df
+--- /dev/null
++++ b/server/internal/router/repair_promptref_test.go
+@@ -0,0 +1,92 @@
++package router
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestRepairPromptRefsExpandAndAvoidCycles(t *testing.T) {
++	c := repairCfg{
++		Prompt:            "global",
++		PromptIDs:         map[string]string{},
++		HostPromptList:    map[string][]string{},
++		HostPrompts:       map[string]string{},
++		HostPromptAllList: []string{"shared"},
++	}
++	c.HostPromptList["u#1"] = []string{"alpha rule"}
++	c.HostPromptList["u#2"] = []string{"beta rule references #P1 and #P2"}
++	c.HostPromptList["u#3"] = []string{"gamma rule references #P2"}
++	repairEnsurePromptIDs(&c)
++	if c.PromptIDs["u#1"] != "P1" || c.PromptIDs["u#2"] != "P2" || c.PromptIDs["u#3"] != "P3" {
++		t.Fatalf("unexpected ids: %#v", c.PromptIDs)
++	}
++	base := "use #P1 and #P3 and #P1"
++	out := repairAppendPromptRefs(c, base, "u#2")
++	if !strings.Contains(out, "alpha rule") {
++		t.Fatalf("referenced prompt not attached: %q", out)
++	}
++	if !strings.Contains(out, "gamma rule") {
++		t.Fatalf("second referenced prompt not attached: %q", out)
++	}
++	if strings.Contains(out, "beta rule") {
++		t.Fatalf("self prompt must not be attached: %q", out)
++	}
++	if strings.Count(out, "alpha rule") != 1 {
++		t.Fatalf("duplicate reference expanded twice: %q", out)
++	}
++	if !strings.Contains(out, "پرامپت‌های ارجاع‌شده") {
++		t.Fatalf("missing reference header: %q", out)
++	}
++}
++
++func TestRepairPromptRefsNoopWithoutRefs(t *testing.T) {
++	c := repairCfg{Prompt: "g", PromptIDs: map[string]string{"global": "G"}}
++	base := "plain prompt"
++	if got := repairAppendPromptRefs(c, base, ""); got != base {
++		t.Fatalf("unexpected expansion: %q", got)
++	}
++}
++
++func TestRepairPromptItemTags(t *testing.T) {
++	c := repairCfg{
++		Prompt:         "global",
++		PromptIDs:      map[string]string{},
++		HostPromptList: map[string][]string{"u#9": {"first item", "second item"}},
++		HostPrompts:    map[string]string{},
++	}
++	repairEnsurePromptIDs(&c)
++	if c.PromptIDs["u#9"] != "P9" {
++		t.Fatalf("group id: %#v", c.PromptIDs)
++	}
++	ids := c.HostPromptItemIDs["u#9"]
++	if len(ids) != 2 || ids[0] != "P9.1" || ids[1] != "P9.2" {
++		t.Fatalf("item ids: %#v", c.HostPromptItemIDs)
++	}
++	out := repairAppendPromptRefs(c, "use #"+ids[1], "u#10")
++	if !strings.Contains(out, "second item") {
++		t.Fatalf("item prompt not attached: %q", out)
++	}
++	if strings.Contains(out, "first item") {
++		t.Fatalf("only the referenced item must be attached: %q", out)
++	}
++}
++
++func TestRepairUserPromptRefs(t *testing.T) {
++	c := repairCfg{
++		Prompt:         "global rules",
++		PromptIDs:      map[string]string{},
++		HostPromptList: map[string][]string{"u#1": {"alpha item"}},
++		HostPrompts:    map[string]string{},
++	}
++	repairEnsurePromptIDs(&c)
++	out := repairUserPromptRefs(c, "please use #G and #P1.1")
++	if !strings.Contains(out, "global rules") {
++		t.Fatalf("global tag not expanded: %q", out)
++	}
++	if !strings.Contains(out, "alpha item") {
++		t.Fatalf("item tag not expanded: %q", out)
++	}
++	if !strings.Contains(out, "ارجاع‌های پیام شما") {
++		t.Fatalf("missing user reference header: %q", out)
++	}
++}
+diff --git a/server/internal/router/repair_workers.go b/server/internal/router/repair_workers.go
+new file mode 100644
+index 0000000..15c97f5
+--- /dev/null
++++ b/server/internal/router/repair_workers.go
+@@ -0,0 +1,443 @@
++package router
++
++import (
++	"context"
++	"crypto/rand"
++	"encoding/hex"
++	"fmt"
++	"net/http"
++	"os"
++	"path/filepath"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++)
++
++const (
++	repairWorkersKey = "repair_workers"
++	repairWorkerLogs = "repair_worker_logs"
++)
++
++type repairWorker struct {
++	ID           string   `json:"id"`
++	Name         string   `json:"name"`
++	Prompt       string   `json:"prompt"`
++	Enabled      bool     `json:"enabled"`
++	Schedule     string   `json:"schedule"` // interval | daily
++	IntervalMin  int      `json:"intervalMin"`
++	DailyAt      string   `json:"dailyAt"` // HH:MM
++	Model        string   `json:"model"`   // deepseek-flash | deepseek-v4-pro | ""
++	LastRun      int64    `json:"lastRun"`
++	NextRun      int64    `json:"nextRun"`
++	LastStatus   string   `json:"lastStatus"`
++	LastError    string   `json:"lastError"`
++	LastReply    string   `json:"lastReply"`
++	Progress     int      `json:"progress"`
++	Steps        []string `json:"steps"`
++	LastDuration int64    `json:"lastDuration"`
++	CreatedAt    int64    `json:"createdAt"`
++}
++
++type repairWorkerRun struct {
++	TS       int64    `json:"ts"`
++	Status   string   `json:"status"`
++	Reply    string   `json:"reply"`
++	Error    string   `json:"error"`
++	Steps    []string `json:"steps"`
++	Duration int64    `json:"duration"`
++}
++
++var (
++	repairWorkerMu      sync.Mutex
++	repairWorkerCancels = map[string]context.CancelFunc{}
++	repairWorkerRunning = map[string]bool{}
++)
++
++func repairWorkerNewID() string {
++	var b [8]byte
++	_, _ = rand.Read(b[:])
++	return fmt.Sprintf("w%d-%s", time.Now().UnixNano(), hex.EncodeToString(b[:]))
++}
++
++func (r *Router) repairWorkers() []repairWorker {
++	var list []repairWorker
++	_ = r.Store.GetJSON(repairWorkersKey, &list)
++	if list == nil {
++		list = []repairWorker{}
++	}
++	sort.Slice(list, func(i, j int) bool { return list[i].CreatedAt < list[j].CreatedAt })
++	return list
++}
++
++func (r *Router) repairWorkersSave(list []repairWorker) { r.Store.PutJSON(repairWorkersKey, list, 0) }
++
++func (r *Router) repairWorkerUpdate(id string, fn func(*repairWorker)) {
++	list := r.repairWorkers()
++	for i := range list {
++		if list[i].ID == id {
++			fn(&list[i])
++			r.repairWorkersSave(list)
++			return
++		}
++	}
++}
++
++func (r *Router) repairWorkerLogs() map[string][]repairWorkerRun {
++	out := map[string][]repairWorkerRun{}
++	_ = r.Store.GetJSON(repairWorkerLogs, &out)
++	if out == nil {
++		out = map[string][]repairWorkerRun{}
++	}
++	return out
++}
++
++func (r *Router) repairWorkerLogAdd(id string, run repairWorkerRun) {
++	m := r.repairWorkerLogs()
++	list := append([]repairWorkerRun{run}, m[id]...)
++	if len(list) > 10 {
++		list = list[:10]
++	}
++	m[id] = list
++	r.Store.PutJSON(repairWorkerLogs, m, 0)
++}
++
++func (r *Router) repairWorkerRunningCheck(id string) bool {
++	repairWorkerMu.Lock()
++	defer repairWorkerMu.Unlock()
++	return repairWorkerRunning[id]
++}
++
++func (r *Router) repairWorkerCancel(id string) bool {
++	repairWorkerMu.Lock()
++	cancel := repairWorkerCancels[id]
++	repairWorkerMu.Unlock()
++	if cancel == nil {
++		return false
++	}
++	cancel()
++	r.repairWorkerUpdate(id, func(w *repairWorker) {
++		w.LastStatus = "canceled"
++		w.LastError = "توسط کاربر متوقف شد"
++		w.Progress = 100
++	})
++	return true
++}
++
++func repairWorkerNext(w repairWorker, now time.Time) int64 {
++	if w.Schedule == "daily" {
++		hh, mm := 9, 0
++		if p := strings.Split(strings.TrimSpace(w.DailyAt), ":"); len(p) == 2 {
++			if v, err := strconv.Atoi(p[0]); err == nil && v >= 0 && v < 24 {
++				hh = v
++			}
++			if v, err := strconv.Atoi(p[1]); err == nil && v >= 0 && v < 60 {
++				mm = v
++			}
++		}
++		t := time.Date(now.Year(), now.Month(), now.Day(), hh, mm, 0, 0, now.Location())
++		if !t.After(now) {
++			t = t.AddDate(0, 0, 1)
++		}
++		return t.Unix()
++	}
++	n := w.IntervalMin
++	if n <= 0 {
++		n = 60
++	}
++	return now.Add(time.Duration(n) * time.Minute).Unix()
++}
++
++// issueWorkerToken creates a short-lived admin web session for a worker run.
++// The token is placed only in the agent environment (CG_WEB_TOKEN).
++func (r *Router) issueWorkerToken(ttl time.Duration) string {
++	now := time.Now()
++	exp := now.Add(ttl).Unix()
++	uid := r.AdminID
++	sid := webSessID()
++	webSessMu.Lock()
++	m := r.webSessAll()
++	key := strconv.FormatInt(uid, 10)
++	arr := make([]webSess, 0, len(m[key])+1)
++	for _, s := range m[key] {
++		if s.Exp > now.Unix() {
++			arr = append(arr, s)
++		}
++	}
++	if len(arr) >= webSessMax {
++		arr = arr[len(arr)-webSessMax+1:]
++	}
++	arr = append(arr, webSess{ID: sid, UID: uid, Created: now.Unix(), Exp: exp, Last: now.Unix(), IP: "worker", UA: "cg-worker", Device: "worker"})
++	m[key] = arr
++	r.webSessSave(m)
++	webSessMu.Unlock()
++	return r.webSignSession(uid, exp, sid)
++}
++
++func (r *Router) repairWorkerContext(c repairCfg, w repairWorker, token string) string {
++	var b strings.Builder
++	b.WriteString("# WORKER — Cloud Guardian scheduled agent\n\n")
++	fmt.Fprintf(&b, "Worker: %s\n\n", w.Name)
++	b.WriteString("## Goal / prompt\n")
++	b.WriteString(w.Prompt)
++	b.WriteString("\n\n## Panels\n")
++	for i, p := range r.PanelsRaw() {
++		fmt.Fprintf(&b, "- [%d] %s — %s\n", i, pname(p), p.URL)
++	}
++	b.WriteString("\n## HOST cards (persisted mirror; load real configs from the API)\n")
++	for _, h := range r.repairHosts() {
++		fmt.Fprintf(&b, "- panel=%s id=%s remark=%s address=%s port=%v disabled=%v\n",
++			strv(h["panelName"]), strv(h["id"]), strv(h["remark"]), strings.Join(hfList(h["address"]), ","), h["port"], boolVal(h["disabled"]))
++	}
++	b.WriteString("\n## Prompts (tags: #G / #S1 / #P<hostID>[.n])\n")
++	for _, d := range repairPromptDocs(c) {
++		fmt.Fprintf(&b, "### [%s] %s\n%s\n\n", d.ID, d.Label, d.Text)
++	}
++	b.WriteString("## Feature API\n")
++	b.WriteString("Base: http://127.0.0.1:53128 — token: $CG_WEB_TOKEN (admin, this run only).\n")
++	b.WriteString("- GET /api/tools/repair (panels/hosts/config/log)\n")
++	b.WriteString("- GET /api/tools/repair/configs?idx=N (refresh a panel's hosts)\n")
++	b.WriteString("- POST /api/tools/repair/test {idx,hostId} (real speed/health test)\n")
++	b.WriteString("- POST /api/tools/repair/host {idx,id,disabled} (toggle)\n")
++	b.WriteString("- POST /api/tools/repair/run (run repair engine)\n")
++	b.WriteString("- GET /api/tools/repair/chat; POST /api/tools/repair/chat/reset\n")
++	b.WriteString("\n## Sandbox\n")
++	b.WriteString("- Writable: /opt/cloud-guardian/agent/workspace (feature-server/, feature-webui/, custom-overlay/)\n")
++	b.WriteString("- Production /opt/cloud-guardian is read-only; do not read /root or production secrets.\n")
++	b.WriteString("- Changes to workspace source are not auto-deployed; state what must be deployed.\n")
++	b.WriteString("\n## Response style\n")
++	b.WriteString("- Work autonomously; use the tools. Final report max 6 lines: result, key evidence, next action.\n")
++	b.WriteString("- Respect explicit constraints in the goal (e.g. do not change/restart a server/front).\n")
++	b.WriteString("- Never claim success without a tool result. Report real errors.\n")
++	return b.String()
++}
++
++func (r *Router) runRepairWorker(w repairWorker) {
++	ctx, cancel := context.WithTimeout(context.Background(), repairAgentTimeout)
++	defer cancel()
++	repairWorkerMu.Lock()
++	repairWorkerCancels[w.ID] = cancel
++	repairWorkerRunning[w.ID] = true
++	repairWorkerMu.Unlock()
++	defer func() {
++		repairWorkerMu.Lock()
++		delete(repairWorkerCancels, w.ID)
++		delete(repairWorkerRunning, w.ID)
++		repairWorkerMu.Unlock()
++	}()
++
++	c := r.repairCfg()
++	if repairModelOK(strings.TrimSpace(w.Model)) {
++		c.DSModel = strings.TrimSpace(w.Model)
++	}
++	token := r.issueWorkerToken(30 * time.Minute)
++	ctxText := r.repairWorkerContext(c, w, token)
++	ctxPath := filepath.Join(repairAgentWorkspace, "WORKER-"+w.ID+".md")
++	if err := os.WriteFile(ctxPath, []byte(ctxText), 0o644); err != nil {
++		r.finishRepairWorker(w, 0, "", nil, fmt.Errorf("نوشتن context ناموفق: %w", err))
++		return
++	}
++	session := r.repairAgentSessionGet("worker", w.ID)
++	start := time.Now()
++	r.repairWorkerUpdate(w.ID, func(x *repairWorker) {
++		x.LastRun = start.Unix()
++		x.LastStatus = "running"
++		x.Progress = 5
++		x.Steps = []string{"در حال آماده‌سازی ورکر…"}
++		x.LastError = ""
++		x.LastReply = ""
++	})
++	onStep := func(label string, p int) {
++		r.repairWorkerUpdate(w.ID, func(x *repairWorker) {
++			if label != "" {
++				x.Steps = append(x.Steps, label)
++				if len(x.Steps) > 40 {
++					x.Steps = x.Steps[len(x.Steps)-40:]
++				}
++			}
++			if p > x.Progress {
++				x.Progress = p
++			}
++		})
++	}
++	reply, steps, newSession, err := r.runOpenCode(ctx, c, session, ctxPath, w.Prompt, token, onStep)
++	if newSession != "" {
++		r.repairAgentSessionSet("worker", w.ID, newSession)
++	}
++	r.finishRepairWorker(w, time.Since(start), reply, steps, err)
++}
++
++func (r *Router) finishRepairWorker(w repairWorker, dur time.Duration, reply string, steps []string, err error) {
++	status := "ok"
++	errText := ""
++	if err != nil {
++		status = "error"
++		errText = truncRune(err.Error(), 500)
++	}
++	now := time.Now()
++	r.repairWorkerUpdate(w.ID, func(x *repairWorker) {
++		if x.LastStatus == "canceled" && status == "error" {
++			status = "canceled"
++		}
++		x.LastStatus = status
++		x.Progress = 100
++		x.LastError = errText
++		x.LastReply = truncRune(reply, 6000)
++		x.Steps = steps
++		x.LastDuration = int64(dur.Seconds())
++		x.LastRun = now.Unix()
++		x.NextRun = repairWorkerNext(*x, now)
++	})
++	r.repairWorkerLogAdd(w.ID, repairWorkerRun{TS: now.Unix(), Status: status, Reply: truncRune(reply, 6000), Error: errText, Steps: steps, Duration: int64(dur.Seconds())})
++	if r.Bot != nil {
++		icon := "✅"
++		if status == "error" {
++			icon = "❌"
++		} else if status == "canceled" {
++			icon = "⏹"
++		}
++		msg := fmt.Sprintf("%s ورکر «%s»\nوضعیت: %s · %ds\n%s", icon, w.Name, status, int64(dur.Seconds()), truncRune(reply, 700))
++		go r.Bot.Send(r.AdminID, msg, nil)
++	}
++}
++
++func (r *Router) WorkerTick() {
++	now := time.Now()
++	list := r.repairWorkers()
++	for i := range list {
++		w := &list[i]
++		if !w.Enabled || w.NextRun > now.Unix() {
++			continue
++		}
++		if r.repairWorkerRunningCheck(w.ID) {
++			continue
++		}
++		w.NextRun = repairWorkerNext(*w, now)
++		r.repairWorkersSave(list)
++		go r.runRepairWorker(*w)
++		return
++	}
++}
++
++func (r *Router) webRepairWorkers(w http.ResponseWriter, req *http.Request, uid int64) {
++	webOK(w, map[string]any{"workers": r.repairWorkers(), "logs": r.repairWorkerLogs()})
++}
++
++func (r *Router) webRepairWorkersSave(w http.ResponseWriter, req *http.Request, uid int64) {
++	var in repairWorker
++	if !webDecode(w, req, &in) {
++		return
++	}
++	in.Name = strings.TrimSpace(in.Name)
++	in.Prompt = strings.TrimSpace(in.Prompt)
++	if in.Name == "" || in.Prompt == "" {
++		webErr(w, http.StatusBadRequest, "نام و پرامپت ورکر لازم است")
++		return
++	}
++	if in.Schedule != "daily" {
++		in.Schedule = "interval"
++	}
++	if in.IntervalMin <= 0 {
++		in.IntervalMin = 60
++	}
++	if in.Schedule == "daily" && !strings.Contains(in.DailyAt, ":") {
++		in.DailyAt = "09:00"
++	}
++	if in.Model != "" && !repairModelOK(in.Model) {
++		in.Model = ""
++	}
++	list := r.repairWorkers()
++	now := time.Now()
++	if strings.TrimSpace(in.ID) == "" {
++		in.ID = repairWorkerNewID()
++		in.CreatedAt = now.Unix()
++		in.NextRun = repairWorkerNext(in, now)
++		list = append(list, in)
++	} else {
++		found := false
++		for i := range list {
++			if list[i].ID == in.ID {
++				in.CreatedAt = list[i].CreatedAt
++				in.LastRun = list[i].LastRun
++				in.LastStatus = list[i].LastStatus
++				in.LastError = list[i].LastError
++				in.LastReply = list[i].LastReply
++				in.Progress = list[i].Progress
++				in.Steps = list[i].Steps
++				in.LastDuration = list[i].LastDuration
++				in.NextRun = repairWorkerNext(in, now)
++				list[i] = in
++				found = true
++				break
++			}
++		}
++		if !found {
++			webErr(w, http.StatusNotFound, "ورکر پیدا نشد")
++			return
++		}
++	}
++	r.repairWorkersSave(list)
++	webOK(w, map[string]any{"ok": true, "id": in.ID, "nextRun": in.NextRun})
++}
++
++func (r *Router) webRepairWorkersDel(w http.ResponseWriter, req *http.Request, uid int64) {
++	var in struct {
++		ID string `json:"id"`
++	}
++	if !webDecode(w, req, &in) {
++		return
++	}
++	id := strings.TrimSpace(in.ID)
++	list := r.repairWorkers()
++	kept := make([]repairWorker, 0, len(list))
++	for _, x := range list {
++		if x.ID != id {
++			kept = append(kept, x)
++		}
++	}
++	r.repairWorkersSave(kept)
++	webOK(w, map[string]any{"ok": true})
++}
++
++func (r *Router) webRepairWorkersRun(w http.ResponseWriter, req *http.Request, uid int64) {
++	var in struct {
++		ID string `json:"id"`
++	}
++	if !webDecode(w, req, &in) {
++		return
++	}
++	id := strings.TrimSpace(in.ID)
++	var found *repairWorker
++	for _, w := range r.repairWorkers() {
++		if w.ID == id {
++			cp := w
++			found = &cp
++			break
++		}
++	}
++	if found == nil {
++		webErr(w, http.StatusNotFound, "ورکر پیدا نشد")
++		return
++	}
++	if r.repairWorkerRunningCheck(id) {
++		webErr(w, http.StatusConflict, "این ورکر همین حالا در حال اجراست")
++		return
++	}
++	go r.runRepairWorker(*found)
++	webOK(w, map[string]any{"ok": true, "started": true})
++}
++
++func (r *Router) webRepairWorkersCancel(w http.ResponseWriter, req *http.Request, uid int64) {
++	var in struct {
++		ID string `json:"id"`
++	}
++	if !webDecode(w, req, &in) {
++		return
++	}
++	if !r.repairWorkerCancel(strings.TrimSpace(in.ID)) {
++		webErr(w, http.StatusNotFound, "ورکر در حال اجرا نیست")
++		return
++	}
++	webOK(w, map[string]any{"ok": true, "status": "canceled"})
++}
+diff --git a/server/internal/router/webapp.go b/server/internal/router/webapp.go
+index b4b0042..b5acaf6 100644
+--- a/server/internal/router/webapp.go
++++ b/server/internal/router/webapp.go
+@@ -58,6 +58,34 @@ func (r *Router) WebApp() http.Handler {
+ 	mux.HandleFunc("/api/tools/cfgtest/watch", r.webAuthed(r.webCfgTestWatch))
+ 	mux.HandleFunc("/api/tools/cfgtest/hist", r.webAuthed(r.webCfgTestHistClear))
+ 	mux.HandleFunc("/api/tools/cfgtest/engine", r.webAuthed(r.webCfgTestEngine))
++	mux.HandleFunc("/api/tools/repair", r.webAuthed(r.webRepairGet))
++	mux.HandleFunc("/api/tools/repair/save", r.webAuthed(r.webRepairSave))
++	mux.HandleFunc("/api/tools/repair/run", r.webAuthed(r.webRepairRun))
++	mux.HandleFunc("/api/tools/repair/hist", r.webAuthed(r.webRepairHist))
++	mux.HandleFunc("/api/tools/repair/chat", r.webAuthed(r.webRepairChat))
++	mux.HandleFunc("/api/tools/repair/chat/send", r.webAuthed(r.webRepairChatSend))
++	mux.HandleFunc("/api/tools/repair/chat/reset", r.webAuthed(r.webRepairChatReset))
++	mux.HandleFunc("/api/tools/repair/users", r.webAuthed(r.webRepairUsers))
++	mux.HandleFunc("/api/tools/repair/user", r.webAuthed(r.webRepairUser))
++	mux.HandleFunc("/api/tools/repair/configs", r.webAuthed(r.webRepairConfigs))
++	mux.HandleFunc("/api/tools/repair/configs/clear", r.webAuthed(r.webRepairConfigsClear))
++	mux.HandleFunc("/api/tools/repair/host", r.webAuthed(r.webRepairHost))
++	mux.HandleFunc("/api/tools/repair/testkey", r.webAuthed(r.webRepairTestKey))
++	mux.HandleFunc("/api/tools/repair/test", r.webAuthed(r.webRepairTest))
++	mux.HandleFunc("/api/tools/repair/agent", r.webAuthed(r.webRepairAgent))
++	mux.HandleFunc("/api/tools/repair/agent/status", r.webAuthed(r.webRepairAgentStatus))
++	mux.HandleFunc("/api/tools/repair/agent/cancel", r.webAuthed(r.webRepairAgentCancel))
++	mux.HandleFunc("/api/tools/repair/workers", r.webAuthed(r.webRepairWorkers))
++	mux.HandleFunc("/api/tools/repair/workers/save", r.webAuthed(r.webRepairWorkersSave))
++	mux.HandleFunc("/api/tools/repair/workers/del", r.webAuthed(r.webRepairWorkersDel))
++	mux.HandleFunc("/api/tools/repair/workers/run", r.webAuthed(r.webRepairWorkersRun))
++	mux.HandleFunc("/api/tools/repair/workers/cancel", r.webAuthed(r.webRepairWorkersCancel))
++	mux.HandleFunc("/api/tools/cfblocks", r.webAuthed(r.webCfBlocks))
++	mux.HandleFunc("/api/tools/cfblocks/events", r.webAuthed(r.webCfBlockEvents))
++	mux.HandleFunc("/api/tools/cfblocks/rules", r.webAuthed(r.webCfBlockRules))
++	mux.HandleFunc("/api/tools/cfblocks/skip", r.webAuthed(r.webCfBlockSkip))
++	mux.HandleFunc("/api/tools/cfblocks/rule", r.webAuthed(r.webCfBlockRule))
++	mux.HandleFunc("/api/tools/cfblocks/test", r.webAuthed(r.webCfBlockTest))
+ 	mux.HandleFunc("/api/tools/cfcheck", r.webAuthed(r.webToolsCfCheck))
+ 	mux.HandleFunc("/api/tools/cfcheck/run", r.webAuthed(r.webCfHealthRun))
+ 	mux.HandleFunc("/api/tools/cfcheck/cfg", r.webAuthed(r.webCfHealthCfgSave))
+@@ -243,7 +271,7 @@ var webSections = map[string]bool{
+ 	"": true, "home": true, "srv": true, "rem": true, "pg": true, "um": true,
+ 	"dom": true, "hf": true, "hfd": true, "hook": true, "mail": true, "set": true,
+ 	"fo": true, "hub": true, "cfcheck": true, "cfgtest": true, "hs": true,
+-	"morebot": true, "sms": true, "fastly": true, "blubank": true,
++	"morebot": true, "sms": true, "fastly": true, "blubank": true, "repair": true, "cfblocks": true,
+ 	"hetzner": true, "cloudflare": true, "arvan": true,
+ }
+ 
+diff --git a/server/internal/router/webautoupdate.go b/server/internal/router/webautoupdate.go
+index 414ffed..3451c93 100644
+--- a/server/internal/router/webautoupdate.go
++++ b/server/internal/router/webautoupdate.go
+@@ -20,6 +20,9 @@ import (
+ const autoUpdateKey = "auto_update"
+ 
+ func (r *Router) autoUpdateOn() bool {
++	if r.Store.Get("custom_overlay") == "1" {
++		return false
++	}
+ 	if strings.TrimSpace(os.Getenv("CG_AUTO_UPDATE")) == "0" {
+ 		return false
+ 	}
+diff --git a/server/internal/router/webcfblocks.go b/server/internal/router/webcfblocks.go
+new file mode 100644
+index 0000000..7a97f71
+--- /dev/null
++++ b/server/internal/router/webcfblocks.go
+@@ -0,0 +1,185 @@
++package router
++
++import (
++	"context"
++	"net/http"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/aknuun/cg-server/internal/cf"
++)
++
++func (r *Router) webCfBlocks(w http.ResponseWriter, req *http.Request, uid int64) {
++	accs := r.cfAccs()
++	out := make([]map[string]any, 0, len(accs))
++	for i, a := range accs {
++		out = append(out, map[string]any{"i": i, "name": a.Name})
++	}
++	acc := 0
++	if v := strings.TrimSpace(req.URL.Query().Get("acc")); v != "" {
++		acc = atoiSafe(v)
++	}
++	zones := []cf.Zone{}
++	zerr := ""
++	if acc >= 0 && acc < len(accs) {
++		if cli, err := r.webCfClient(acc); err != nil {
++			zerr = err.Error()
++		} else if zz, err := cli.Zones(); err != nil {
++			zerr = err.Error()
++		} else {
++			zones = zz
++		}
++	}
++	token := r.cfTokenStatus(acc)
++	if zerr != "" {
++		token["ok"] = false
++		token["error"] = zerr
++	}
++	webOK(w, map[string]any{"accounts": out, "zones": zones, "error": zerr, "token": token})
++}
++func (r *Router) cfTokenStatus(acc int) map[string]any {
++	accs := r.cfAccs()
++	if acc < 0 || acc >= len(accs) {
++		return map[string]any{"ok": false, "has": false}
++	}
++	return map[string]any{"ok": true, "has": strings.TrimSpace(accs[acc].Token) != ""}
++}
++func (r *Router) webCfBlockEvents(w http.ResponseWriter, req *http.Request, uid int64) {
++	acc := atoiSafe(req.URL.Query().Get("acc"))
++	zid := strings.TrimSpace(req.URL.Query().Get("zone"))
++	ray := strings.TrimSpace(req.URL.Query().Get("ray"))
++	hours := atoiSafe(req.URL.Query().Get("hours"))
++	cli, err := r.webCfClient(acc)
++	if err != nil {
++		webErr(w, http.StatusBadRequest, err.Error())
++		return
++	}
++	if zid == "" {
++		webErr(w, http.StatusBadRequest, "zone لازم است")
++		return
++	}
++	ev, err := cli.FirewallEvents(zid, ray, hours, 200)
++	if err != nil {
++		webErr(w, http.StatusBadGateway, err.Error())
++		return
++	}
++	webOK(w, map[string]any{"events": ev})
++}
++func (r *Router) webCfBlockRules(w http.ResponseWriter, req *http.Request, uid int64) {
++	acc := atoiSafe(req.URL.Query().Get("acc"))
++	zid := strings.TrimSpace(req.URL.Query().Get("zone"))
++	cli, err := r.webCfClient(acc)
++	if err != nil {
++		webErr(w, http.StatusBadRequest, err.Error())
++		return
++	}
++	if zid == "" {
++		webErr(w, http.StatusBadRequest, "zone لازم است")
++		return
++	}
++	rules, err := cli.Rulesets(zid)
++	if err != nil {
++		webErr(w, http.StatusBadGateway, err.Error())
++		return
++	}
++	webOK(w, map[string]any{"rules": rules})
++}
++func (r *Router) webCfBlockSkip(w http.ResponseWriter, req *http.Request, uid int64) {
++	var in struct {
++		Acc         int      `json:"acc"`
++		Zone        string   `json:"zone"`
++		Expression  string   `json:"expression"`
++		Description string   `json:"description"`
++		Phases      []string `json:"phases"`
++	}
++	if !webDecode(w, req, &in) {
++		return
++	}
++	in.Zone = strings.TrimSpace(in.Zone)
++	in.Expression = strings.TrimSpace(in.Expression)
++	if in.Zone == "" || in.Expression == "" {
++		webErr(w, http.StatusBadRequest, "zone و expression لازم است")
++		return
++	}
++	if len(in.Phases) == 0 {
++		in.Phases = []string{"http_response_firewall_managed"}
++	}
++	cli, err := r.webCfClient(in.Acc)
++	if err != nil {
++		webErr(w, http.StatusBadRequest, err.Error())
++		return
++	}
++	out, err := cli.AddSkip(in.Zone, in.Expression, in.Description, in.Phases)
++	if err != nil {
++		webErr(w, http.StatusBadGateway, err.Error())
++		return
++	}
++	zoneName := in.Zone
++	if z, err := cli.Zone(in.Zone); err == nil {
++		zoneName = strv(z["name"])
++	}
++	r.cfAuditAdd(uid, in.Acc, in.Zone, zoneName, "cfblocks_skip", in.Expression)
++	webOK(w, map[string]any{"ok": true, "result": out})
++}
++func (r *Router) webCfBlockRule(w http.ResponseWriter, req *http.Request, uid int64) {
++	var in struct {
++		Acc     int    `json:"acc"`
++		Zone    string `json:"zone"`
++		Ruleset string `json:"ruleset"`
++		Rule    string `json:"rule"`
++		Enabled bool   `json:"enabled"`
++	}
++	if !webDecode(w, req, &in) {
++		return
++	}
++	in.Zone = strings.TrimSpace(in.Zone)
++	in.Ruleset = strings.TrimSpace(in.Ruleset)
++	in.Rule = strings.TrimSpace(in.Rule)
++	if in.Zone == "" || in.Ruleset == "" || in.Rule == "" {
++		webErr(w, http.StatusBadRequest, "zone/ruleset/rule لازم است")
++		return
++	}
++	cli, err := r.webCfClient(in.Acc)
++	if err != nil {
++		webErr(w, http.StatusBadRequest, err.Error())
++		return
++	}
++	if err := cli.SetRuleEnabled(in.Zone, in.Ruleset, in.Rule, in.Enabled); err != nil {
++		webErr(w, http.StatusBadGateway, err.Error())
++		return
++	}
++	zoneName := in.Zone
++	if z, err := cli.Zone(in.Zone); err == nil {
++		zoneName = strv(z["name"])
++	}
++	r.cfAuditAdd(uid, in.Acc, in.Zone, zoneName, "cfblocks_rule", in.Rule+" enabled="+strconv.FormatBool(in.Enabled))
++	webOK(w, map[string]any{"ok": true, "enabled": in.Enabled})
++}
++func (r *Router) webCfBlockTest(w http.ResponseWriter, req *http.Request, uid int64) {
++	var in struct {
++		URLs []string `json:"urls"`
++	}
++	if !webDecode(w, req, &in) {
++		return
++	}
++	if len(in.URLs) == 0 {
++		webErr(w, http.StatusBadRequest, "حداقل یک URL لازم است")
++		return
++	}
++	if len(in.URLs) > 6 {
++		in.URLs = in.URLs[:6]
++	}
++	cli, err := r.webCfClient(0)
++	if err != nil {
++		webErr(w, http.StatusBadRequest, err.Error())
++		return
++	}
++	ctx, cancel := context.WithTimeout(req.Context(), 40*time.Second)
++	defer cancel()
++	out := make([]cf.WSTestResult, 0, len(in.URLs))
++	for _, u := range in.URLs {
++		out = append(out, cli.TestWebSocket(ctx, u))
++	}
++	webOK(w, map[string]any{"results": out})
++}
+diff --git a/server/internal/router/webmorebot.go b/server/internal/router/webmorebot.go
+index a777c9c..a665334 100644
+--- a/server/internal/router/webmorebot.go
++++ b/server/internal/router/webmorebot.go
+@@ -29,6 +29,7 @@ type bluAcc struct {
+ 	User     string `json:"user,omitempty"`
+ 	Pass     string `json:"pass,omitempty"`
+ 	Disabled bool   `json:"disabled,omitempty"`
++	Provider string `json:"provider,omitempty"`
+ }
+ 
+ type morebotCfg struct {
+@@ -83,6 +84,10 @@ func (c morebotCfg) rule() morebot.Rule {
+ func (c *morebotCfg) normBlus() {
+ 	for i := range c.Blus {
+ 		c.Blus[i].URL = strings.TrimSpace(c.Blus[i].URL)
++		c.Blus[i].Provider = strings.ToLower(strings.TrimSpace(c.Blus[i].Provider))
++		if c.Blus[i].Provider == "" {
++			c.Blus[i].Provider = "blu"
++		}
+ 		if c.Blus[i].URL == "" {
+ 			continue
+ 		}
+@@ -91,10 +96,10 @@ func (c *morebotCfg) normBlus() {
+ 		}
+ 	}
+ 	if len(c.Blus) == 0 && c.BluURL != "" {
+-		c.Blus = []bluAcc{{Name: "حساب ۱", URL: c.BluURL}}
++		c.Blus = []bluAcc{{Name: "حساب ۱", URL: c.BluURL, Provider: "blu"}}
+ 	}
+ 	if len(c.Blus) == 0 {
+-		c.Blus = []bluAcc{{Name: "حساب ۱", URL: "http://127.0.0.1:8088"}}
++		c.Blus = []bluAcc{{Name: "حساب ۱", URL: "http://127.0.0.1:8088", Provider: "blu"}}
+ 	}
+ 	c.BluURL = ""
+ }
+@@ -292,10 +297,11 @@ const bluPendKey = "blu_otp_pending"
+ // used to attach an account without them: the bridge worked until its session
+ // expired and then had nothing to renew with.
+ type bluPendRec struct {
+-	At   int64  `json:"at"`
+-	User string `json:"user"`
+-	Pass string `json:"pass"`
+-	Name string `json:"name"`
++	At       int64  `json:"at"`
++	User     string `json:"user"`
++	Pass     string `json:"pass"`
++	Name     string `json:"name"`
++	Provider string `json:"provider,omitempty"`
+ }
+ 
+ func (r *Router) bluPend() map[string]bluPendRec {
+@@ -333,10 +339,18 @@ func (r *Router) bluPendClear(port int) {
+ 
+ // bluPublic strips passwords from the account list before it reaches a browser:
+ // the form only needs to know whether one is stored.
++func bluPublicPending(in map[string]bluPendRec) map[string]map[string]any {
++	out := map[string]map[string]any{}
++	for port, rec := range in {
++		out[port] = map[string]any{"at": rec.At, "user": rec.User, "name": rec.Name, "has_pass": rec.Pass != "", "provider": rec.Provider}
++	}
++	return out
++}
++
+ func bluPublic(in []bluAcc) []map[string]any {
+ 	out := make([]map[string]any, 0, len(in))
+ 	for _, b := range in {
+-		out = append(out, map[string]any{"name": b.Name, "url": b.URL, "user": b.User, "has_pass": b.Pass != "", "disabled": b.Disabled})
++		out = append(out, map[string]any{"name": b.Name, "url": b.URL, "user": b.User, "has_pass": b.Pass != "", "disabled": b.Disabled, "provider": b.Provider})
+ 	}
+ 	return out
+ }
+@@ -348,7 +362,10 @@ func bluAccAt(accs []bluAcc, base string) (bluAcc, bool) {
+ 		if strings.TrimRight(strings.TrimSpace(a.URL), "/") != base {
+ 			continue
+ 		}
+-		if a.User == "" || a.Pass == "" {
++		if a.Provider == "" {
++			a.Provider = "blu"
++		}
++		if strings.TrimSpace(a.User) == "" || (a.Provider != "wipad" && a.Pass == "") {
+ 			return bluAcc{}, false
+ 		}
+ 		return a, true
+@@ -375,9 +392,20 @@ func (r *Router) bluAutoLogin(ctx context.Context, bc *blu.Client, base string,
+ // the owner just pressed: it skips the throttle (the pending-code guard stays,
+ // because that is the thing that costs an SMS).
+ func (r *Router) bluLogin(ctx context.Context, bc *blu.Client, base string, acc bluAcc, force bool) error {
+-	if strings.TrimSpace(acc.User) == "" || acc.Pass == "" {
++	provider := strings.ToLower(strings.TrimSpace(acc.Provider))
++	if provider == "" {
++		provider = "blu"
++	}
++	if provider == "wipad" {
++		if strings.TrimSpace(acc.User) == "" {
++			return errors.New("برای این حساب شماره موبایل ویپاد ذخیره نشده؛ در «حساب بلو» واردش کن")
++		}
++	} else if strings.TrimSpace(acc.User) == "" || acc.Pass == "" {
+ 		return errors.New("برای این حساب نام کاربری و رمز ذخیره نشده؛ در «حساب بلو» واردش کن")
+ 	}
++	if provider == "wipad" && !force {
++		return errors.New("نشست ویپاد منقضی شده؛ در «حساب بلو» دوباره وارد شو و کد پیامکی را بزن")
++	}
+ 	port := portOfURL(base)
+ 	if rec, ok := r.bluPendPort(port); ok && time.Now().Unix()-rec.At < 900 {
+ 		return errors.New("بانک منتظر کد پیامکی است؛ کد را در «حساب بلو» بزن")
+@@ -415,7 +443,7 @@ func (r *Router) bluLogin(ctx context.Context, bc *blu.Client, base string, acc
+ 	if res.OTP {
+ 		// The bank has sent its one message. Remember the request so nothing
+ 		// else asks again until the owner types the code.
+-		r.bluPendSet(port, bluPendRec{User: acc.User, Pass: acc.Pass, Name: acc.Name})
++		r.bluPendSet(port, bluPendRec{User: acc.User, Pass: acc.Pass, Name: acc.Name, Provider: provider})
+ 		r.Store.Put(errKey, "بانک کد پیامکی فرستاد", 0)
+ 		return errors.New("بانک کد پیامکی فرستاد؛ کد را در «حساب بلو» وارد کن")
+ 	}
+@@ -778,6 +806,15 @@ func (r *Router) morebotRun(dry bool) ([]morebot.Verdict, string) {
+ 				if err := r.mbRetry(ctx, &c, func(mb *morebot.Client) error { return mb.Reject(ctx, p.ID, v.Reason) }); err != nil {
+ 					v.Action = "manual"
+ 					v.Reason = "رد نشد: " + err.Error()
++				} else {
++					v.Reason = "خودکار رد شد — " + v.Reason
++					if v.UserID > 0 {
++						if err := r.morebotTellUser(ctx, &c, v.UserID, mbFakeNote); err != nil {
++							r.morebotErr("ارسال پیام رد خودکار ناموفق", err.Error())
++						}
++					}
++					r.evRow("morebot", "auto", "info", "خودکار رد شد",
++						mbNum(p.Amount)+" تومان", "رد شد", mbVerdictText(v))
+ 				}
+ 			}
+ 		}
+@@ -940,6 +977,7 @@ func (r *Router) MorebotTick() {
+ 	_ = retry
+ 	var lines []string
+ 	var ok []morebot.Verdict
++	rejects := 0
+ 	facts := map[int64]string{}
+ 	for _, v := range vs {
+ 		v.Panel = r.morebotCfg().PanelURL
+@@ -963,12 +1001,18 @@ func (r *Router) MorebotTick() {
+ 			lines = append(lines, line)
+ 			ok = append(ok, v)
+ 		}
++		if strings.HasPrefix(v.Reason, "خودکار رد شد") {
++			rejects++
++			lines = append(lines, mbVerdictText(v))
++		}
+ 	}
+ 	if len(lines) == 0 || r.Bot == nil || r.AlertOff("morebot") {
+ 		return
+ 	}
+ 	head := "✅ تایید خودکار موربات"
+-	if len(lines) > 1 {
++	if rejects > 0 {
++		head = "🤖 نتیجهٔ خودکار موربات"
++	} else if len(lines) > 1 {
+ 		head = "✅ " + faD(strconv.Itoa(len(lines))) + " رسید موربات خودکار تایید شد"
+ 	}
+ 	text := tg.Card(head, strings.Join(lines, "\n\n"))
+@@ -1078,6 +1122,10 @@ func (r *Router) morebotVote(chat, mid int64, data string) {
+ 		return
+ 	}
+ 	var info morebotAskInfo
++	if _, ok := r.Store.GetOK(morebotAskKey + id); !ok {
++		r.Show(chat, mid, "این رسید قبلاً بررسی شده یا سؤالش منقضی شده است.", nil)
++		return
++	}
+ 	r.Store.GetJSON(morebotAskKey+id, &info)
+ 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+ 	defer cancel()
+@@ -1346,6 +1394,7 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 			User     string     `json:"user"`
+ 			Pass     string     `json:"pass"`
+ 			Code     string     `json:"code"`
++			Provider string     `json:"provider"`
+ 			Proxy    string     `json:"proxy"`
+ 		}
+ 		if !webDecode(w, req, &in) {
+@@ -1502,7 +1551,7 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 					return
+ 				}
+ 			}
+-			r.mbAttachBluCreds(&c, a.Name, base, a.User, a.Pass)
++			r.mbAttachBluCreds(&c, a.Name, base, a.User, a.Pass, "blu")
+ 			webOK(w, map[string]any{"ok": true, "url": base})
+ 
+ 		case "blu_login":
+@@ -1565,14 +1614,25 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 			return
+ 
+ 		case "blu_add":
+-			// A second Blu login needs its own bridge process: the service keeps
+-			// one session per process, so a new account is a new port.
+ 			if !r.IsMain(uid) {
+ 				webErr(w, http.StatusForbidden, "فقط ادمین اصلی")
+ 				return
+ 			}
+-			if strings.TrimSpace(in.User) == "" || in.Pass == "" {
+-				webErr(w, http.StatusBadRequest, "نام کاربری و رمز بلو لازم است.")
++			provider := strings.ToLower(strings.TrimSpace(in.Provider))
++			if provider == "" {
++				provider = "blu"
++			}
++			if provider != "blu" && provider != "wipad" {
++				webErr(w, http.StatusBadRequest, "نوع بانک نامعتبر است.")
++				return
++			}
++			label := "بلو"
++			if provider == "wipad" {
++				label = "ویپاد"
++			}
++			user := strings.TrimSpace(in.User)
++			if user == "" || (provider != "wipad" && in.Pass == "") {
++				webErr(w, http.StatusBadRequest, "اطلاعات ورود "+label+" لازم است.")
+ 				return
+ 			}
+ 			for _, b := range c.Blus {
+@@ -1588,10 +1648,11 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 					port = 8089
+ 				}
+ 				base = "http://127.0.0.1:" + strconv.Itoa(port)
+-				// A bridge left over from an interrupted attempt already listens;
+-				// creating it again only churns systemd and can fail while the old
+-				// instance is still starting.
+ 				if _, err := blu.New(base).Status(req.Context()); err != nil {
++					if provider == "wipad" {
++						mbSoftErr(w, "سرویس ویپاد روی این پورت بالا نیست: "+bluFriendly(err))
++						return
++					}
+ 					out, err := exec.CommandContext(req.Context(), "/usr/local/bin/cg-blu-add", strconv.Itoa(port)).CombinedOutput()
+ 					if err != nil {
+ 						mbSoftErr(w, "ساخت حساب بلو ناموفق: "+clipStr(string(out), 200))
+@@ -1603,33 +1664,35 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 			if bport == 0 {
+ 				bport = portOfURL(base)
+ 			}
+-			if rec, ok := r.bluPendPort(bport); ok && time.Now().Unix()-rec.At < 900 {
+-				// A code is already in the phone. Asking again would invalidate it
+-				// and send another SMS, so answer with the request we have.
+-				webOK(w, map[string]any{"url": base, "otp": true, "port": bport})
+-				return
++			if rec, ok := r.bluPendPort(bport); ok {
++				ttl := int64(900)
++				if strings.EqualFold(rec.Provider, "wipad") {
++					ttl = 110
++				}
++				if time.Now().Unix()-rec.At < ttl {
++					webOK(w, map[string]any{"url": base, "otp": true, "port": bport, "provider": provider})
++					return
++				}
+ 			}
+ 			ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
+ 			defer cancel()
+-			res, err := blu.New(base).Login(ctx, strings.TrimSpace(in.User), in.Pass)
++			res, err := blu.New(base).Login(ctx, user, in.Pass)
+ 			if err != nil {
+-				webErr(w, bluHTTP(err), "ورود به بلو ناموفق: "+bluFriendly(err))
++				webErr(w, bluHTTP(err), "ورود به "+label+" ناموفق: "+bluFriendly(err))
+ 				return
+ 			}
+ 			if res.OTP {
+-				if in.Port > 0 {
+-					r.bluPendSet(in.Port, bluPendRec{User: strings.TrimSpace(in.User), Pass: in.Pass, Name: in.Name})
++				if bport > 0 {
++					r.bluPendSet(bport, bluPendRec{User: user, Pass: in.Pass, Name: in.Name, Provider: provider})
+ 				}
+-				webOK(w, map[string]any{"url": base, "otp": true, "port": in.Port})
++				webOK(w, map[string]any{"url": base, "otp": true, "port": bport, "provider": provider})
+ 				return
+ 			}
+-			name, user, pass := in.Name, strings.TrimSpace(in.User), in.Pass
++			name, pass := in.Name, in.Pass
+ 			port := in.Port
+ 			if port == 0 {
+ 				port = portOfURL(base)
+ 			}
+-			// The OTP step may not carry the credentials (an older page, a
+-			// retry after a lost response); the record from the login does.
+ 			if rec, ok := r.bluPendPort(port); ok {
+ 				if user == "" {
+ 					user = rec.User
+@@ -1640,14 +1703,17 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 				if name == "" {
+ 					name = rec.Name
+ 				}
++				if rec.Provider != "" {
++					provider = rec.Provider
++				}
+ 			}
+-			r.mbAttachBluCreds(&c, name, base, user, pass)
+-			webOK(w, map[string]any{"url": base, "otp": false, "done": true})
++			r.mbAttachBluCreds(&c, name, base, user, pass, provider)
++			webOK(w, map[string]any{"url": base, "otp": false, "done": true, "provider": provider})
+ 			return
+ 		case "blu_otp":
+ 			base := strings.TrimRight(strings.TrimSpace(in.URL), "/")
+ 			if base == "" {
+-				webErr(w, http.StatusBadRequest, "آدرس حساب بلو لازم است.")
++				webErr(w, http.StatusBadRequest, "آدرس سرویس بانک لازم است.")
+ 				return
+ 			}
+ 			ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
+@@ -1663,12 +1729,14 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 				return
+ 			}
+ 			name, user, pass := in.Name, strings.TrimSpace(in.User), in.Pass
++			provider := strings.ToLower(strings.TrimSpace(in.Provider))
++			if provider == "" {
++				provider = "blu"
++			}
+ 			port := in.Port
+ 			if port == 0 {
+ 				port = portOfURL(base)
+ 			}
+-			// The OTP step may not carry the credentials (an older page, a
+-			// retry after a lost response); the record from the login does.
+ 			if rec, ok := r.bluPendPort(port); ok {
+ 				if user == "" {
+ 					user = rec.User
+@@ -1679,12 +1747,15 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 				if name == "" {
+ 					name = rec.Name
+ 				}
++				if rec.Provider != "" {
++					provider = rec.Provider
++				}
+ 			}
+-			r.mbAttachBluCreds(&c, name, base, user, pass)
++			r.mbAttachBluCreds(&c, name, base, user, pass, provider)
+ 			if port > 0 {
+ 				r.bluPendClear(port)
+ 			}
+-			webOK(w, map[string]any{"url": base, "done": true})
++			webOK(w, map[string]any{"url": base, "done": true, "provider": provider})
+ 			return
+ 		case "run":
+ 			vs, err := r.morebotRun(in.Dry)
+@@ -1718,6 +1789,7 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 				return mb.Reject(ctx, in.ID, in.Note)
+ 			})
+ 			if err == nil {
++				r.Store.Delete(morebotAskKey + in.ID)
+ 				msgLine := ""
+ 				if in.UserID <= 0 {
+ 					msgLine = "⚠️ شناسهٔ کاربر ذخیره نشده بود؛ پیامی ارسال نشد."
+@@ -1830,30 +1902,36 @@ func (r *Router) webToolsMorebot(w http.ResponseWriter, req *http.Request, uid i
+ 			"auto": c.Auto,
+ 		},
+ 		"blu": status, "morebot": mbState,
+-		"pending":  r.bluPend(),
++		"pending":  bluPublicPending(r.bluPend()),
+ 		"login_at": r.Store.Get(mbLoginAtKey),
+ 	})
+ }
+ 
+ // mbAttachBlu adds a session address to the account list once (by URL), so a
+ // retried login does not leave the same bank listed twice.
+-func (r *Router) mbAttachBluCreds(c *morebotCfg, name, base, user, pass string) {
+-	r.mbAttachBlu(c, name, base)
++func (r *Router) mbAttachBluCreds(c *morebotCfg, name, base, user, pass, provider string) {
++	r.mbAttachBlu(c, name, base, provider)
+ 	for i := range c.Blus {
+ 		if c.Blus[i].URL == base {
+ 			c.Blus[i].User, c.Blus[i].Pass = user, pass
++			c.Blus[i].Provider = provider
+ 		}
+ 	}
+ 	r.morebotSave(*c)
+ }
+ 
+-func (r *Router) mbAttachBlu(c *morebotCfg, name, base string) {
++func (r *Router) mbAttachBlu(c *morebotCfg, name, base, provider string) {
++	provider = strings.ToLower(strings.TrimSpace(provider))
++	if provider == "" {
++		provider = "blu"
++	}
+ 	c.normBlus()
+ 	for i := range c.Blus {
+ 		if c.Blus[i].URL == base {
+ 			if name != "" {
+ 				c.Blus[i].Name = name
+ 			}
++			c.Blus[i].Provider = provider
+ 			r.morebotSave(*c)
+ 			return
+ 		}
+@@ -1861,7 +1939,7 @@ func (r *Router) mbAttachBlu(c *morebotCfg, name, base string) {
+ 	if strings.TrimSpace(name) == "" {
+ 		name = "حساب " + strconv.Itoa(len(c.Blus)+1)
+ 	}
+-	c.Blus = append(c.Blus, bluAcc{Name: name, URL: base})
++	c.Blus = append(c.Blus, bluAcc{Name: name, URL: base, Provider: provider})
+ 	r.morebotSave(*c)
+ }
+ 
+diff --git a/server/internal/router/webmorebot_login_test.go b/server/internal/router/webmorebot_login_test.go
+index 78f1d82..0b60a34 100644
+--- a/server/internal/router/webmorebot_login_test.go
++++ b/server/internal/router/webmorebot_login_test.go
+@@ -157,3 +157,36 @@ func TestBluTransportErrorsAreToldApartFromRefusals(t *testing.T) {
+ 		t.Fatal("nil is not a transport error")
+ 	}
+ }
++
++func TestWipadAccountSkipsAutomaticSms(t *testing.T) {
++	r, _ := bakTestRouter(t)
++	base := "http://127.0.0.1:18099"
++	acc := bluAcc{Name: "ویپاد", URL: base, User: "09121234567", Provider: "wipad"}
++	err := r.bluAutoLogin(context.Background(), blu.New(base), base, acc)
++	if err == nil || !strings.Contains(err.Error(), "ویپاد") {
++		t.Fatalf("wipad auto login must not text, got %v", err)
++	}
++	if _, ok := r.bluPendPort(portOfURL(base)); ok {
++		t.Fatal("wipad auto login must not start a pending login")
++	}
++}
++
++func TestWipadAccountAllowsEmptyPassword(t *testing.T) {
++	accs := []bluAcc{{Name: "ویپاد", URL: "http://127.0.0.1:8089", User: "09121234567", Provider: "wipad"}}
++	acc, ok := bluAccAt(accs, "http://127.0.0.1:8089")
++	if !ok || acc.Provider != "wipad" {
++		t.Fatalf("wipad account should be usable without a password: %+v %v", acc, ok)
++	}
++	bluOnly := []bluAcc{{Name: "بلو", URL: "http://127.0.0.1:8088", User: "u"}}
++	if _, ok := bluAccAt(bluOnly, "http://127.0.0.1:8088"); ok {
++		t.Fatal("blu account without a password must not be usable")
++	}
++}
++
++func TestNormBlusDefaultsProvider(t *testing.T) {
++	c := morebotCfg{Blus: []bluAcc{{Name: "حساب", URL: "http://127.0.0.1:8088"}, {Name: "ویپاد", URL: "http://127.0.0.1:8089", User: "09121234567", Provider: "WIPAD"}}}
++	c.normBlus()
++	if c.Blus[0].Provider != "blu" || c.Blus[1].Provider != "wipad" {
++		t.Fatalf("providers not normalised: %+v", c.Blus)
++	}
++}
+diff --git a/server/internal/router/webpg.go b/server/internal/router/webpg.go
+index 43b1099..b340968 100644
+--- a/server/internal/router/webpg.go
++++ b/server/internal/router/webpg.go
+@@ -138,6 +138,17 @@ func (r *Router) webPgPanelDel(w http.ResponseWriter, req *http.Request, uid int
+ 	lst = append(lst[:in.Index], lst[in.Index+1:]...)
+ 	pg.StorePanels(r.Store, lst)
+ 	r.migratePanelIndexes(in.Index)
++	// Drop this panel's HOST cards too; otherwise they linger after deletion.
++	goneKey := repairPanelKey(gone)
++	hosts := r.repairHosts()
++	keptHosts := hosts[:0]
++	for _, h := range hosts {
++		if repairPanelKey(strv(h["panelUrl"])) == goneKey {
++			continue
++		}
++		keptHosts = append(keptHosts, h)
++	}
++	r.Store.PutJSON(repairHostsKey, keptHosts, 0)
+ 
+ 	mons := ndmon.Monitors(r.Store)
+ 	kept := mons[:0]
+diff --git a/server/internal/router/wsettings.go b/server/internal/router/wsettings.go
+index 5b1c415..7d32619 100644
+--- a/server/internal/router/wsettings.go
++++ b/server/internal/router/wsettings.go
+@@ -55,6 +55,10 @@ func (r *Router) webSetUpdate(w http.ResponseWriter, req *http.Request, uid int6
+ 		webErr(w, http.StatusForbidden, "فقط ادمین اصلی")
+ 		return
+ 	}
++	if r.Store.Get("custom_overlay") == "1" {
++		webErr(w, http.StatusBadRequest, "این نصب تغییرات سفارشی دارد؛ آپدیت خودکار/دستی غیرفعال است. برای آپدیت با پشتیبانی هماهنگ کنید.")
++		return
++	}
+ 	var in struct {
+ 		Tag string `json:"tag"`
+ 	}
